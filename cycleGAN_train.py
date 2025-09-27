@@ -349,196 +349,120 @@ class Downsample(nn.Module):
 
         return x
 
-class ResidualDenseBlock(nn.Module):
-    """Residual Dense Block (RDB).
-
-    Implements a small dense block with local feature fusion and a residual connection.
-    Handles the case where `in_channels != out_channels` by projecting the residual with a 1x1 conv.
-    """
-    def __init__(self, in_channels, out_channels=None, num_layers=4, growth_channels=32):
-        super(ResidualDenseBlock, self).__init__()
-        out_channels = in_channels if out_channels is None else out_channels
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.num_layers = num_layers
-        self.growth_channels = growth_channels
-
-        self.convs = nn.ModuleList()
-        conv_in_channels = in_channels
-        for i in range(num_layers):
-            self.convs.append(nn.Conv2d(conv_in_channels, growth_channels, kernel_size=3, stride=1, padding=1))
-            conv_in_channels += growth_channels
-
-        # Local feature fusion
-        self.lff = nn.Conv2d(conv_in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-        self.act = nn.ReLU(inplace=True)
-
-        # If input and output channels differ, use a 1x1 projection for the residual connection
-        if in_channels != out_channels:
-            self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-        else:
-            self.proj = None
-
-    def forward(self, x):
-        features = [x]
-        for conv in self.convs:
-            inp = torch.cat(features, dim=1)
-            out = self.act(conv(inp))
-            features.append(out)
-        fused = self.lff(torch.cat(features, dim=1))
-        res = self.proj(x) if self.proj is not None else x
-        return fused + res
-
-
-class CBAM(nn.Module):
-    """Convolutional Block Attention Module (CBAM).
-
-    Applies channel attention followed by spatial attention.
-    Reference: "CBAM: Convolutional Block Attention Module", Woo et al., ECCV 2018.
-    """
-    def __init__(self, channels, reduction=16, kernel_size=7):
-        super(CBAM, self).__init__()
-        self.channel_att = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, max(channels // reduction, 1), kernel_size=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(max(channels // reduction, 1), channels, kernel_size=1, bias=True),
-            nn.Sigmoid()
-        )
-
-        self.spatial_att = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # Channel attention (use pooled spatial statistics)
-        avg = torch.mean(x, dim=(2, 3), keepdim=True)
-        ca = self.channel_att(avg)
-        x = x * ca
-
-        # Spatial attention: use channel-wise avg and max
-        avg_pool = torch.mean(x, dim=1, keepdim=True)
-        max_pool, _ = torch.max(x, dim=1, keepdim=True)
-        sa_in = torch.cat([avg_pool, max_pool], dim=1)
-        sa = self.spatial_att(sa_in)
-        x = x * sa
-
-        return x
-
-
-class DilatedMidBlock(nn.Module):
-    """Mid block that uses multiple dilated convolutions to increase receptive field.
-
-    Stacks a few dilated conv layers (dilations: 1,2,4) with a residual connection.
-    """
-    def __init__(self, channels, dilation_rates=(1,2,4)):
-        super(DilatedMidBlock, self).__init__()
-        layers = []
-        for d in dilation_rates:
-            layers.append(nn.Conv2d(channels, channels, kernel_size=3, padding=d, dilation=d))
-            layers.append(nn.GroupNorm(16, channels))
-            layers.append(nn.ReLU(inplace=True))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return x + self.net(x)
-
-
 class Generator(nn.Module):
-    """
-    Generator class for the CycleGAN model using RDB blocks, CBAM attention, and a dilated mid-block.
-    """
-    def __init__(self, in_channels, out_channels, ngf, ch_mult=(1, 2, 4, 8), num_res_blocks=3,
-                 rdb_layers=4, rdb_growth=32, use_cbam=True):
+    '''
+    Generator class for the CycleGAN model.
+    
+    Args:
+        in_channels (int): The number of channels of the input.
+        out_channels (int): The number of channels of the output.
+        ngf (int): The number of convolution filters of the first layer.
+        ch_mult (tuple): The channel multiplier for each resolution level. Default is (1, 2, 4, 8).
+        num_res_blocks (int): The number of residual blocks in each resolution level. Default is 3.
+    '''
+    
+    def __init__(self, in_channels, out_channels, ngf, ch_mult=(1, 2, 4, 8), num_res_blocks=3):
         super(Generator, self).__init__()
-
+        
+        # Check if the number of input channels is equal to the number of output channels
         assert in_channels == out_channels, 'The number of input channels should be equal to the number of output channels.'
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.ngf = ngf
-        self.use_cbam = use_cbam
-
+        
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
 
+        # Initialize the lists of upsample and downsample blocks
         self.up_blocks = nn.ModuleList()
         self.down_blocks = nn.ModuleList()
+        self.mid_block = nn.Module()
 
+        # The first layer of the generator
         self.conv_in = nn.Conv2d(in_channels, ngf, kernel_size=3, stride=1, padding=1)
-
+    
+        # Initialize the number of input channels for each resolution level
         in_ch_mult = (1,) + tuple(ch_mult)
 
-        # Downsample path: replace ResnetBlock with ResidualDenseBlock
+        # Define the downsample and upsample blocks
         for level in range(self.num_resolutions):
             down_block = nn.ModuleList()
+            # The number of input and output channels for the current block
             block_in_channels = ngf * in_ch_mult[level]
             block_out_channels = ngf * ch_mult[level]
 
             for _ in range(self.num_res_blocks):
-                down_block.append(ResidualDenseBlock(block_in_channels, block_out_channels, num_layers=rdb_layers, growth_channels=rdb_growth))
+                # Add a residual block to the downsample block
+                down_block.append(ResnetBlock(block_in_channels, block_out_channels))
                 block_in_channels = block_out_channels
-
+        
             if level != self.num_resolutions - 1:
+                # Add a downsample block to the downsample blocks list
                 down_block.append(Downsample(block_out_channels))
 
             self.down_blocks.append(down_block)
 
-        # Dilated mid block
-        self.mid_block = DilatedMidBlock(ngf * ch_mult[-1])
+        # The middle block of the generator
+        self.mid_block = ResnetBlock(ngf * ch_mult[-1], ngf * ch_mult[-1])
 
-        # Upsample path: use RDBs and Upsample modules
         for level in reversed(range(self.num_resolutions)):
             up_block = nn.ModuleList()
+            # The number of input and output channels for the current block
             block_in_channels = ngf * ch_mult[level]
             block_out_channels = ngf * ch_mult[level]
             block_skip_channels = ngf * ch_mult[level]
 
             for block_idx in range(self.num_res_blocks + 1):
                 if block_idx == self.num_res_blocks:
+                    # If this is the last block, add a residual block with skip connections
                     block_skip_channels = ngf * in_ch_mult[level]
                     block_out_channels = ngf * in_ch_mult[level]
-                up_block.append(ResidualDenseBlock(block_in_channels + block_skip_channels, block_out_channels, num_layers=rdb_layers, growth_channels=rdb_growth))
+                # Add a residual block to the upsample block
+                up_block.append(ResnetBlock(block_in_channels + block_skip_channels, block_out_channels))
                 block_in_channels = block_out_channels
 
             if level != 0:
                 up_block.append(Upsample(block_out_channels))
-
+            
             self.up_blocks.insert(0, up_block)
 
-        # Attention before the output
-        if self.use_cbam:
-            self.cbam = CBAM(ngf)
-        else:
-            self.cbam = None
-
         self.conv_out = torch.nn.Conv2d(ngf, out_channels, kernel_size=3, stride=1, padding=1)
-
+    
     def forward(self, x):
+        '''
+        Forward pass of the CycleGAN model.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after passing through the model.
+        '''
+        # Store the input tensor as the skip connection
         hs = [self.conv_in(x)]
 
+        # Pass the input tensor through the downsample blocks
         for level in range(self.num_resolutions):
             for block in self.down_blocks[level]:
                 h = block(hs[-1])
+                # Store the output tensor of the residual block to the skip connections list
                 hs.append(h)
 
         h = self.mid_block(hs[-1])
 
+        # Pass the input tensor through the upsample blocks
         for level in reversed(range(self.num_resolutions)):
             for block in self.up_blocks[level]:
                 if not isinstance(block, Upsample):
+                    # If the block is not an upsample block, concatenate the skip connection
                     h = torch.cat([h, hs.pop()], dim=1)
                 h = block(h)
-
-        if self.cbam is not None:
-            h = self.cbam(h)
-
+        
         h = self.conv_out(h)
         h = h + x
-
+        
         return h
-
-
+  
 # Discriminator (PatchGAN)
 class Discriminator(nn.Module):
     '''
