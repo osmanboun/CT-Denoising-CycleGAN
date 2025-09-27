@@ -134,14 +134,62 @@ class CT_Dataset(Dataset):
 
 # Transform for the random crop
 class RandomCrop(object):
-    def __init__(self, patch_size):
-        self.patch_size = patch_size
-    
+    """Robust RandomCrop that handles small images by padding when necessary.
+
+    Behavior:
+      - Accepts a torch.Tensor (C,H,W) or (H,W) or numpy array / PIL image (will be converted to tensor).
+      - If the image is smaller than the requested patch_size in any dimension, it is padded (centered) before cropping.
+      - Padding mode defaults to constant (0). You can change pad_mode to 'reflect' or 'replicate' if you prefer.
+
+    Example:
+      RandomCrop(128)(img_tensor) -> tensor of shape (C,128,128)
+    """
+    def __init__(self, patch_size, pad_mode='constant', pad_value=0):
+        self.patch_size = int(patch_size)
+        self.pad_mode = pad_mode
+        self.pad_value = pad_value
+
     def __call__(self, img):
-        # Randomly crop the image into a patch with the size [self.patch_size, self.patch_size]
-        w, h = img.size(-1), img.size(-2)
-        i = random.randint(0, h - self.patch_size)
-        j = random.randint(0, w - self.patch_size)
+        # If input is not a tensor, convert using torchvision helper
+        if not isinstance(img, torch.Tensor):
+            img = torchvision.transforms.functional.to_tensor(img)
+
+        # Ensure tensor has channel dimension: (C,H,W)
+        if img.dim() == 2:
+            img = img.unsqueeze(0)
+        elif img.dim() == 3 and img.shape[0] > img.shape[1] and img.shape[0] > img.shape[2]:
+            # Heuristic: if first dim looks like height (H,W,C), permute to (C,H,W)
+            img = img.permute(2, 0, 1)
+
+        _, h, w = img.shape
+
+        # If patch_size is non-positive, return original
+        if self.patch_size <= 0:
+            return img
+
+        # Pad if image is smaller than patch_size
+        pad_h = max(0, self.patch_size - h)
+        pad_w = max(0, self.patch_size - w)
+        if pad_h > 0 or pad_w > 0:
+            # Distribute padding equally on both sides (center the original image)
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            # torch.nn.functional.pad expects padding as (left, right, top, bottom)
+            img = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode=self.pad_mode, value=self.pad_value)
+            _, h, w = img.shape
+
+        # Now sample a random crop within the (possibly padded) image
+        if h == self.patch_size:
+            i = 0
+        else:
+            i = random.randint(0, h - self.patch_size)
+
+        if w == self.patch_size:
+            j = 0
+        else:
+            j = random.randint(0, w - self.patch_size)
 
         return img[:, i:i + self.patch_size, j:j + self.patch_size]
 
@@ -660,12 +708,12 @@ if __name__ == '__main__':
     parser.add_argument('--path_checkpoint', type=str, default='./CT_denoising')
     parser.add_argument('--model_name', type=str, default='cyclegan_v1')
     parser.add_argument('--path_data', type=str, default='./AAPM_data')
-    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--lambda_cycle', type=int, default=10)
     parser.add_argument('--lambda_iden', type=int, default=5)
     parser.add_argument('--beta1', type=float, default=0.5)
     parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--num_epoch', type=int, default=12)
+    parser.add_argument('--num_epoch', type=int, default=3)
     parser.add_argument('--g_channels', type=int, default=32)
     parser.add_argument('--d_channels', type=int, default=64)
     parser.add_argument('--ch_mult', type=int, nargs='+', default=[1, 2, 4, 8])
