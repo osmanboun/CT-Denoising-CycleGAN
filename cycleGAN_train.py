@@ -741,6 +741,19 @@ def train(
     D_F = Discriminator(1, d_channels).to(device)
     D_Q = Discriminator(1, d_channels).to(device)
 
+    # Convert models to channels_last memory format for improved conv throughput on modern GPUs.
+    # Wrapped in try/except for older PyTorch versions or unsupported devices.
+    if torch.cuda.is_available():
+        try:
+            G_F2Q = G_F2Q.to(memory_format=torch.channels_last)
+            G_Q2F = G_Q2F.to(memory_format=torch.channels_last)
+            D_F = D_F.to(memory_format=torch.channels_last)
+            D_Q = D_Q.to(memory_format=torch.channels_last)
+        except Exception:
+            # If conversion fails, continue with default memory format.
+            pass
+
+
     # Image pools for discriminator history (CycleGAN paper suggests a small buffer, e.g. 50)
     pool_F = ImagePool(pool_size=50)  # stores fake full images (x_QF)
     pool_Q = ImagePool(pool_size=50)  # stores fake quarter images (x_FQ)
@@ -807,9 +820,9 @@ def train(
         losses = {name: Mean() for name in loss_name}
 
         for x_F, x_Q, _ in tqdm(train_dataloader, desc='Step'):
-            # Move the data to the device (GPU or CPU)
-            x_F = x_F.to(device)
-            x_Q = x_Q.to(device)
+            # Move the data to the device (GPU or CPU) and convert to channels_last memory format for faster conv operations.
+            x_F = x_F.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+            x_Q = x_Q.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
 
             # Set 'requires_grad' of the discriminators as 'False' to avoid computing gradients of the discriminators
             set_requires_grad([D_F, D_Q], False)
@@ -917,7 +930,8 @@ def train(
         ssim_vals = []
         with torch.no_grad():
             for v_F, v_Q, _ in val_loader:
-                v_F = v_F.to(device); v_Q = v_Q.to(device)
+                v_F = v_F.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+                v_Q = v_Q.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
                 pred = G_Q2F(v_Q)
                 pred_np = pred.squeeze().cpu().numpy()
                 ref_np = v_F.squeeze().cpu().numpy()
