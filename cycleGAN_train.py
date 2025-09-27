@@ -553,6 +553,11 @@ def train(
     G_optim = torch.optim.Adam(itertools.chain(G_F2Q.parameters(), G_Q2F.parameters()), lr, betas=(beta1, beta2))
     D_optim = torch.optim.Adam(itertools.chain(D_F.parameters(), D_Q.parameters()), lr, betas=(beta1, beta2))
 
+    # Mixed precision scalers (enabled when CUDA is available)
+    use_amp = (device.type == 'cuda')
+    scaler_G = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler_D = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     # Define loss functions
     adv_loss = nn.MSELoss()
     cycle_loss = nn.L1Loss()
@@ -601,58 +606,64 @@ def train(
             x_F = x_F.to(device)
             x_Q = x_Q.to(device)
 
-            # Set 'requires_grad' of the discriminators as 'False' to avoid computing gradients of the discriminators
+            # ------------------------
+            #  Train Generators (with AMP)
+            # ------------------------
             set_requires_grad([D_F, D_Q], False)
 
-            # Generate fake images using the generators
-            x_FQ = G_F2Q(x_F)
-            x_QF = G_Q2F(x_Q)
-            
-            # Generate cyclic images using the generators
-            x_QFQ = G_F2Q(x_QF)
-            x_FQF = G_Q2F(x_FQ)
-            
-            # Generate identity images using the generators
-            x_QQ = G_F2Q(x_Q)
-            x_FF = G_Q2F(x_F)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                # Generate fake images using the generators
+                x_FQ = G_F2Q(x_F)
+                x_QF = G_Q2F(x_Q)
 
-            # Calculate adversarial losses
-            G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
-            G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
-            
-            # Calculate cycle losses
-            G_cycle_loss_F = cycle_loss(x_FQF, x_F)
-            G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
-            
-            # Calculate identity losses
-            G_iden_loss_F = iden_loss(x_FF, x_F)
-            G_iden_loss_Q = iden_loss(x_QQ, x_Q)
-            
-            # Calculate total losses
-            G_adv_loss = G_adv_loss_F + G_adv_loss_Q
-            G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
-            G_iden_loss = G_iden_loss_F + G_iden_loss_Q
-            G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
+                # Generate cyclic images using the generators
+                x_QFQ = G_F2Q(x_QF)
+                x_FQF = G_Q2F(x_FQ)
 
-            # Update the generators
+                # Generate identity images using the generators
+                x_QQ = G_F2Q(x_Q)
+                x_FF = G_Q2F(x_F)
+
+                # Calculate adversarial losses (generators try to fool discriminators)
+                G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
+                G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
+
+                # Calculate cycle losses
+                G_cycle_loss_F = cycle_loss(x_FQF, x_F)
+                G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
+
+                # Calculate identity losses
+                G_iden_loss_F = iden_loss(x_FF, x_F)
+                G_iden_loss_Q = iden_loss(x_QQ, x_Q)
+
+                # Total generator losses
+                G_adv_loss = G_adv_loss_F + G_adv_loss_Q
+                G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
+                G_iden_loss = G_iden_loss_F + G_iden_loss_Q
+                G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
+
+            # Update the generators with scaled gradients
             G_optim.zero_grad()
-            G_total_loss.backward()
-            G_optim.step()
-            
-            # Set 'requires_grad' of the discriminators as 'True'
+            scaler_G.scale(G_total_loss).backward()
+            scaler_G.step(G_optim)
+            scaler_G.update()
+
+            # ------------------------
+            #  Train Discriminators (with AMP)
+            # ------------------------
             set_requires_grad([D_F, D_Q], True)
 
-            # Calculate adversarial losses for the discriminators
-            D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
-            D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
-            D_total_loss_F = D_adv_loss_F / 2.0
-            D_total_loss_Q = D_adv_loss_Q / 2.0
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
+                D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
+                D_total_loss_F = D_adv_loss_F / 2.0
+                D_total_loss_Q = D_adv_loss_Q / 2.0
+                D_total_loss = D_total_loss_F + D_total_loss_Q
 
-            # Update the discriminators
             D_optim.zero_grad()
-            D_total_loss_F.backward()
-            D_total_loss_Q.backward()
-            D_optim.step()
+            scaler_D.scale(D_total_loss).backward()
+            scaler_D.step(D_optim)
+            scaler_D.update()
 
             # Calculate the average loss during one epoch
             losses['G_adv_loss_F'](G_adv_loss_F.detach())
@@ -663,7 +674,7 @@ def train(
             losses['G_iden_loss_Q'](G_iden_loss_Q.detach())
             losses['D_adv_loss_F'](D_adv_loss_F.detach())
             losses['D_adv_loss_Q'](D_adv_loss_Q.detach())
-    
+
         for name in loss_name:
             losses_list[name].append(losses[name].result())
         
