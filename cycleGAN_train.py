@@ -1,13 +1,16 @@
+
 import random
 import argparse
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+from multiprocessing import cpu_count
 
 from os import listdir, makedirs
 from os.path import isdir, join 
@@ -16,38 +19,120 @@ from torch.nn import init
 
 from tqdm.auto import tqdm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+from torch.cuda.amp import autocast, GradScaler
 
 
-# Functions for caculating PSNR, SSIM
+# Functions for calculating PSNR, SSIM
 # Peak Signal-to-Noise Ratio
 def psnr(A, ref):
-    ref = ref.copy()
+    """
+    Compute PSNR between two 2D numpy arrays A and ref.
+    Both arrays are clipped at -1000 (HU floor). Images are normalized to [0,1]
+    using the min/max of the reference image and PSNR is computed with data_range=1.0.
+    Returns a float (higher is better). Handles constant images.
+    """
     A = A.copy()
-    ref[ref < -1000] = -1000
+    ref = ref.copy()
     A[A < -1000] = -1000
-    val_min = -1000
-    val_max = np.amax(ref)
-    if val_max == val_min:
-        return 0.0
-    ref = (ref - val_min) / (val_max - val_min)
-    A = (A - val_min) / (val_max - val_min)
-    out = peak_signal_noise_ratio(ref, A, data_range=1.0)
-    return out
+    ref[ref < -1000] = -1000
+
+    ref_min = float(np.min(ref))
+    ref_max = float(np.max(ref))
+    denom = ref_max - ref_min
+    if denom <= 0:
+        return 100.0
+
+    ref_n = (ref - ref_min) / denom
+    A_n = (A - ref_min) / denom
+
+    return peak_signal_noise_ratio(ref_n, A_n, data_range=1.0)
 
 # Structural similarity index
 def ssim(A, ref):
-    ref = ref.copy()
+    """
+    Compute SSIM between two 2D numpy arrays A and ref.
+    Both arrays are clipped at -1000 and normalized to [0,1] using the
+    reference image range. Returns a float in [-1,1] (higher is better).
+    """
     A = A.copy()
-    ref[ref < -1000] = -1000
+    ref = ref.copy()
     A[A < -1000] = -1000
-    val_min = -1000
-    val_max = np.amax(ref)
-    if val_max == val_min:
-        return 0.0
-    ref = (ref - val_min) / (val_max - val_min)
-    A = (A - val_min) / (val_max - val_min)
-    out = structural_similarity(ref, A, data_range=1.0)
-    return out
+    ref[ref < -1000] = -1000
+
+    ref_min = float(np.min(ref))
+    ref_max = float(np.max(ref))
+    denom = ref_max - ref_min
+    if denom <= 0:
+        return 1.0
+
+    ref_n = (ref - ref_min) / denom
+    A_n = (A - ref_min) / denom
+
+    # structural_similarity expects 2D arrays and a proper data_range
+    return structural_similarity(ref_n, A_n, data_range=1.0)
+
+
+# Torch-based SSIM (differentiable) and gradient loss for training
+import math
+
+def _gaussian(window_size, sigma):
+    gauss = torch.Tensor([math.exp(-(x - window_size//2)**2/(2*sigma**2)) for x in range(window_size)])
+    return gauss / gauss.sum()
+
+
+def create_window(window_size, channel):
+    _1D = _gaussian(window_size, 1.5).unsqueeze(1)
+    _2D = _1D.mm(_1D.t()).float().unsqueeze(0).unsqueeze(0)
+    window = _2D.expand(channel, 1, window_size, window_size).contiguous()
+    return window
+
+
+def ssim_torch(img1, img2, window_size=11, val_range=1.0):
+    """
+    Compute mean SSIM over batch using a Gaussian window. Returns a scalar in [-1,1].
+    Assumes img1 and img2 are torch tensors shaped (B, C, H, W) and scaled to [0, val_range].
+    """
+    (_, channel, _, _) = img1.size()
+    window = create_window(window_size, channel).to(img1.device).type(img1.dtype)
+
+    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=channel) - mu1_mu2
+
+    C1 = (0.01 * val_range) ** 2
+    C2 = (0.03 * val_range) ** 2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean()
+
+
+def gradient_loss(pred, target):
+    """
+    L1 loss between image gradients (Sobel) of pred and target. Works on BxCxHxW tensors.
+    """
+    # Sobel kernels
+    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=pred.device, dtype=pred.dtype).view(1, 1, 3, 3)
+    sobel_y = sobel_x.permute(0, 1, 3, 2)
+
+    channels = pred.shape[1]
+    sobel_x = sobel_x.repeat(channels, 1, 1, 1)
+    sobel_y = sobel_y.repeat(channels, 1, 1, 1)
+
+    grad_pred_x = F.conv2d(pred, sobel_x, padding=1, groups=channels)
+    grad_pred_y = F.conv2d(pred, sobel_y, padding=1, groups=channels)
+    grad_target_x = F.conv2d(target, sobel_x, padding=1, groups=channels)
+    grad_target_y = F.conv2d(target, sobel_y, padding=1, groups=channels)
+
+    loss = (grad_pred_x - grad_target_x).abs().mean() + (grad_pred_y - grad_target_y).abs().mean()
+    return loss
+
 
 # Initialize parameters of neural networks
 def init_weights(net):
@@ -87,6 +172,50 @@ class Mean:
     
     def result(self):
         return self.mean
+
+
+# Image pool for storing previously generated images (used to update discriminator)
+class ImagePool:
+    """Initialize an image buffer that stores previously generated images.
+
+    This buffer enables the discriminator to be trained on a history of generated images
+    rather than only the most recent ones, which stabilizes GAN training (CycleGAN trick).
+    """
+    def __init__(self, pool_size=50):
+        self.pool_size = int(pool_size)
+        if self.pool_size > 0:
+            self.num_imgs = 0
+            self.images = []
+
+    def query(self, images):
+        """
+        Return images for discriminator training. Accepts a batch tensor (B,C,H,W).
+        For each image in the batch: if the pool isn't full, store and return image.
+        Otherwise, with probability 0.5 return a previously stored image (and replace it with the new one),
+        or return the new image directly.
+        """
+        if self.pool_size == 0:
+            return images
+
+        return_images = []
+        for img in images:
+            img = img.unsqueeze(0)
+            if self.num_imgs < self.pool_size:
+                # store and return
+                self.images.append(img.clone().detach())
+                self.num_imgs += 1
+                return_images.append(img)
+            else:
+                if random.random() > 0.5:
+                    # use previously stored image
+                    idx = random.randint(0, self.pool_size - 1)
+                    tmp = self.images[idx].clone().detach()
+                    # replace the stored image with the new one
+                    self.images[idx] = img.clone().detach()
+                    return_images.append(tmp)
+                else:
+                    return_images.append(img)
+        return torch.cat(return_images, dim=0)
 
 
 # CT dataset
@@ -141,70 +270,76 @@ class CT_Dataset(Dataset):
 
 # Transform for the random crop
 class RandomCrop(object):
-    """Robust RandomCrop that handles small images by padding when necessary.
-
-    Behavior:
-      - Accepts a torch.Tensor (C,H,W) or (H,W) or numpy array / PIL image (will be converted to tensor).
-      - If the image is smaller than the requested patch_size in any dimension, it is padded (centered) before cropping.
-      - Padding mode defaults to constant (0). You can change pad_mode to 'reflect' or 'replicate' if you prefer.
-
-    Example:
-      RandomCrop(128)(img_tensor) -> tensor of shape (C,128,128)
-    """
-    def __init__(self, patch_size, pad_mode='constant', pad_value=0):
-        self.patch_size = int(patch_size)
-        self.pad_mode = pad_mode
-        self.pad_value = pad_value
+    def __init__(self, patch_size):
+        self.patch_size = patch_size
 
     def __call__(self, img):
-        # If input is not a tensor, convert using torchvision helper
-        if not isinstance(img, torch.Tensor):
-            img = torchvision.transforms.functional.to_tensor(img)
+        """
+        Robust random crop that handles inputs as numpy arrays or torch tensors,
+        supports channel-last (H, W, C) and channel-first (C, H, W) formats,
+        and pads images smaller than the patch size using reflection padding.
+        Returns a tensor with shape (C, patch_size, patch_size).
+        """
+        # If input is a numpy array, convert to torch tensor
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img).float()
 
-        # Ensure tensor has channel dimension: (C,H,W)
+        # Ensure tensor type
+        if not torch.is_tensor(img):
+            img = torch.tensor(img, dtype=torch.float32)
+
+        # Handle 2D images (H x W) -> add channel dim
         if img.dim() == 2:
             img = img.unsqueeze(0)
-        elif img.dim() == 3 and img.shape[0] > img.shape[1] and img.shape[0] > img.shape[2]:
-            # Heuristic: if first dim looks like height (H,W,C), permute to (C,H,W)
+
+        # Handle channel-last (H x W x C) -> convert to C x H x W
+        elif img.dim() == 3 and img.shape[-1] <= 4 and img.shape[0] > 4:
             img = img.permute(2, 0, 1)
 
-        _, h, w = img.shape
+        # Now img is expected to be C x H x W
+        C, H, W = img.shape
 
-        # If patch_size is non-positive, return original
-        if self.patch_size <= 0:
-            return img
-
-        # Pad if image is smaller than patch_size
-        pad_h = max(0, self.patch_size - h)
-        pad_w = max(0, self.patch_size - w)
+        # Pad if image smaller than patch size (reflect padding)
+        pad_h = max(0, self.patch_size - H)
+        pad_w = max(0, self.patch_size - W)
         if pad_h > 0 or pad_w > 0:
-            # Distribute padding equally on both sides (center the original image)
-            pad_top = pad_h // 2
-            pad_bottom = pad_h - pad_top
-            pad_left = pad_w // 2
-            pad_right = pad_w - pad_left
-            # torch.nn.functional.pad expects padding as (left, right, top, bottom)
-            img = F.pad(img, (pad_left, pad_right, pad_top, pad_bottom), mode=self.pad_mode, value=self.pad_value)
-            _, h, w = img.shape
+            # F.pad expects (pad_w_left, pad_w_right, pad_h_top, pad_h_bottom)
+            img = F.pad(img, (0, pad_w, 0, pad_h), mode='reflect')
+            C, H, W = img.shape
 
-        # Now sample a random crop within the (possibly padded) image
-        if h == self.patch_size:
-            i = 0
-        else:
-            i = random.randint(0, h - self.patch_size)
-
-        if w == self.patch_size:
-            j = 0
-        else:
-            j = random.randint(0, w - self.patch_size)
+        # Random crop coordinates (safe since we padded if necessary)
+        i = random.randint(0, H - self.patch_size)
+        j = random.randint(0, W - self.patch_size)
 
         return img[:, i:i + self.patch_size, j:j + self.patch_size]
 
 
+
 # Make dataloader for training/test
-def make_dataloader(path, train_batch_size=1, is_train=True):
-    # Path of 'train' and 'test' folders    
+def make_dataloader(path, train_batch_size=1, is_train=True, num_workers=None):
+    """
+    Create a DataLoader for training or testing.
+
+    Small I/O improvements:
+    - Automatically choose a sensible number of workers (defaults to cpu_count()-1 up to 4).
+    - Use pin_memory only when CUDA is available.
+    - Enable persistent_workers when num_workers>0 to avoid worker spawn overhead each epoch.
+    - Set a small prefetch_factor when using multiple workers.
+    """
+    # Path of 'train' and 'test' folders
     dataset_path = join(path, 'train') if is_train else join(path, 'test')
+
+    # Choose number of workers if not explicitly provided
+    if num_workers is None:
+        try:
+            n_workers = max(0, min(4, cpu_count() - 1))
+        except Exception:
+            n_workers = 2
+    else:
+        n_workers = max(0, int(num_workers))
+
+    pin_memory = torch.cuda.is_available()
+    persistent = True if n_workers > 0 else False
 
     # Transform for training data: convert to tensor, random horizontal/verical flip, random crop
     if is_train:
@@ -215,14 +350,29 @@ def make_dataloader(path, train_batch_size=1, is_train=True):
             RandomCrop(128)
         ])
         train_dataset = CT_Dataset(dataset_path, train_transform)
-        dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, num_workers=0, pin_memory=True)
+        dataloader = DataLoader(
+            train_dataset,
+            batch_size=train_batch_size,
+            shuffle=True,
+            num_workers=n_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent,
+            prefetch_factor=2 if n_workers > 0 else 2
+        )
     else:
         test_transform = torchvision.transforms.Compose([
             torchvision.transforms.ToTensor()
         ])
 
         test_dataset = CT_Dataset(dataset_path, test_transform)
-        dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+        dataloader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=n_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent
+        )
 
     return dataloader
 
@@ -251,21 +401,10 @@ class ResnetBlock(nn.Module):
         self.out_channels = out_channels
 
         # Group normalization layer and convolutional layer
-        # make num_groups divide channels
-        use_groups = min(num_groups, in_channels)
-        if use_groups < 1:
-            use_groups = 1
-        while in_channels % use_groups != 0 and use_groups > 1:
-            use_groups -= 1
-        self.norm1 = torch.nn.GroupNorm(num_groups=use_groups, num_channels=in_channels, eps=1e-6, affine=True)
+        self.norm1 = torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
         self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
-        use_groups2 = min(num_groups, out_channels)
-        if use_groups2 < 1:
-            use_groups2 = 1
-        while out_channels % use_groups2 != 0 and use_groups2 > 1:
-            use_groups2 -= 1
-        self.norm2 = torch.nn.GroupNorm(num_groups=use_groups2, num_channels=out_channels, eps=1e-6, affine=True)
+        self.norm2 = torch.nn.GroupNorm(num_groups=num_groups, num_channels=out_channels, eps=1e-6, affine=True)
         self.conv2 = torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         
         # Shortcut connection
@@ -367,216 +506,174 @@ class Downsample(nn.Module):
 
         return x
 
-
-# --- Lightweight Residual Dense Block (Light RDB) ---
-class LightRDB(nn.Module):
-    """A small Residual Dense Block with 3 convs and dense connections, then a 1x1 to restore channels."""
-    def __init__(self, in_channels, growth=16, num_layers=3):
-        super().__init__()
-        self.in_channels = in_channels
-        g = int(growth)
-        self.convs = nn.ModuleList()
-        for i in range(num_layers):
-            in_ch = in_channels + i * g
-            self.convs.append(nn.Conv2d(in_ch, g, kernel_size=3, padding=1))
-        self.conv1x1 = nn.Conv2d(in_channels + num_layers * g, in_channels, kernel_size=1)
-        self.act = nn.LeakyReLU(0.2, inplace=True)
-
-    def forward(self, x):
-        features = [x]
-        for conv in self.convs:
-            inp = torch.cat(features, dim=1)
-            out = self.act(conv(inp))
-            features.append(out)
-        out = torch.cat(features, dim=1)
-        out = self.conv1x1(out)
-        return x + 0.2 * out
-
-
-# --- CBAM: Convolutional Block Attention Module ---
-class CBAM(nn.Module):
-    def __init__(self, channels, reduction=16, kernel_size=7):
-        super().__init__()
-        # Channel attention
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False)
-        )
-        self.sigmoid = nn.Sigmoid()
-        # Spatial attention
-        self.spatial = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2, bias=False)
-
-    def forward(self, x):
-        b, c, h, w = x.size()
-        # Channel attention
-        avg_pool = F.adaptive_avg_pool2d(x, 1).view(b, c)
-        max_pool = F.adaptive_max_pool2d(x, 1).view(b, c)
-        avg_out = self.mlp(avg_pool)
-        max_out = self.mlp(max_pool)
-        ch_att = self.sigmoid(avg_out + max_out).view(b, c, 1, 1)
-        x = x * ch_att
-        # Spatial attention
-        avg_map = torch.mean(x, dim=1, keepdim=True)
-        max_map, _ = torch.max(x, dim=1, keepdim=True)
-        spatial_cat = torch.cat([avg_map, max_map], dim=1)
-        sp_att = self.sigmoid(self.spatial(spatial_cat))
-        x = x * sp_att
-        return x
-
-
-# --- Dilated Mid Block ---
-class DilatedMidBlock(nn.Module):
-    """Stack of conv layers with increasing dilation to enlarge receptive field without downsampling."""
-    def __init__(self, channels, num_layers=3, base_dilation=1):
-        super().__init__()
-        layers = []
-        for i in range(num_layers):
-            dilation = base_dilation * (2 ** i)
-            padding = dilation
-            layers.append(nn.Conv2d(channels, channels, kernel_size=3, padding=padding, dilation=dilation))
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return x + 0.2 * self.net(x)
-
-
 class Generator(nn.Module):
     '''
-    Generator class for the CycleGAN model with LightRDB + CBAM + DilatedMidBlock in the bottleneck.
+    Generator class for the CycleGAN model.
+    
+    Args:
+        in_channels (int): The number of channels of the input.
+        out_channels (int): The number of channels of the output.
+        ngf (int): The number of convolution filters of the first layer.
+        ch_mult (tuple): The channel multiplier for each resolution level. Default is (1, 2, 4, 8).
+        num_res_blocks (int): The number of residual blocks in each resolution level. Default is 3.
     '''
     
-    def __init__(self, in_channels, out_channels, ngf, ch_mult=(1, 2, 4, 8), num_res_blocks=3, use_cbam=True, rdb_growth=16):
+    def __init__(self, in_channels, out_channels, ngf, ch_mult=(1, 2, 4, 8), num_res_blocks=3):
         super(Generator, self).__init__()
+        
+        # Check if the number of input channels is equal to the number of output channels
         assert in_channels == out_channels, 'The number of input channels should be equal to the number of output channels.'
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.ngf = ngf
-        self.use_cbam = use_cbam
-
+        
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
 
+        # Initialize the lists of upsample and downsample blocks
+        self.up_blocks = nn.ModuleList()
+        self.down_blocks = nn.ModuleList()
+        self.mid_block = nn.Module()
+
         # The first layer of the generator
         self.conv_in = nn.Conv2d(in_channels, ngf, kernel_size=3, stride=1, padding=1)
-
-        # Initialize down and up blocks
-        self.down_blocks = nn.ModuleList()
-        self.up_blocks = nn.ModuleList()
-
+    
+        # Initialize the number of input channels for each resolution level
         in_ch_mult = (1,) + tuple(ch_mult)
 
-        # Build downsampling path
+        # Define the downsample and upsample blocks
         for level in range(self.num_resolutions):
             down_block = nn.ModuleList()
+            # The number of input and output channels for the current block
             block_in_channels = ngf * in_ch_mult[level]
             block_out_channels = ngf * ch_mult[level]
 
             for _ in range(self.num_res_blocks):
+                # Add a residual block to the downsample block
                 down_block.append(ResnetBlock(block_in_channels, block_out_channels))
                 block_in_channels = block_out_channels
-
+        
             if level != self.num_resolutions - 1:
+                # Add a downsample block to the downsample blocks list
                 down_block.append(Downsample(block_out_channels))
 
             self.down_blocks.append(down_block)
 
-        # Bottleneck: Dilated mid-block + Light RDB + optional CBAM
-        bottleneck_channels = ngf * ch_mult[-1]
-        self.mid_block = nn.Sequential(
-            DilatedMidBlock(bottleneck_channels, num_layers=3, base_dilation=1),
-            LightRDB(bottleneck_channels, growth=rdb_growth, num_layers=3)
-        )
-        if self.use_cbam:
-            self.cbam = CBAM(bottleneck_channels, reduction=8)
-        else:
-            self.cbam = nn.Identity()
+        # The middle block of the generator
+        self.mid_block = ResnetBlock(ngf * ch_mult[-1], ngf * ch_mult[-1])
 
-        # Build upsampling path (mirror)
         for level in reversed(range(self.num_resolutions)):
             up_block = nn.ModuleList()
+            # The number of input and output channels for the current block
             block_in_channels = ngf * ch_mult[level]
             block_out_channels = ngf * ch_mult[level]
             block_skip_channels = ngf * ch_mult[level]
 
             for block_idx in range(self.num_res_blocks + 1):
                 if block_idx == self.num_res_blocks:
+                    # If this is the last block, add a residual block with skip connections
                     block_skip_channels = ngf * in_ch_mult[level]
                     block_out_channels = ngf * in_ch_mult[level]
+                # Add a residual block to the upsample block
                 up_block.append(ResnetBlock(block_in_channels + block_skip_channels, block_out_channels))
                 block_in_channels = block_out_channels
 
             if level != 0:
                 up_block.append(Upsample(block_out_channels))
-
+            
             self.up_blocks.insert(0, up_block)
 
         self.conv_out = torch.nn.Conv2d(ngf, out_channels, kernel_size=3, stride=1, padding=1)
-
+    
     def forward(self, x):
-        # Encoder
+        '''
+        Forward pass of the CycleGAN model.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after passing through the model.
+        '''
+        # Store the input tensor as the skip connection
         hs = [self.conv_in(x)]
+
+        # Pass the input tensor through the downsample blocks
         for level in range(self.num_resolutions):
             for block in self.down_blocks[level]:
                 h = block(hs[-1])
+                # Store the output tensor of the residual block to the skip connections list
                 hs.append(h)
 
-        # Bottleneck
         h = self.mid_block(hs[-1])
-        h = self.cbam(h)
 
-        # Decoder
+        # Pass the input tensor through the upsample blocks
         for level in reversed(range(self.num_resolutions)):
             for block in self.up_blocks[level]:
                 if not isinstance(block, Upsample):
+                    # If the block is not an upsample block, concatenate the skip connection
                     h = torch.cat([h, hs.pop()], dim=1)
                 h = block(h)
-
+        
         h = self.conv_out(h)
         h = h + x
+        
         return h
-
+  
 # Discriminator (PatchGAN)
 class Discriminator(nn.Module):
     '''
-    PatchGAN discriminator with proper InstanceNorm layers created in __init__ (no on-the-fly creation).
+    Discriminator network for CycleGAN.
+
+    Args:
+        in_channels (int): Number of input channels.
+        ndf (int): Number of discriminator filters.
+
     '''
+
     def __init__(self, in_channels, ndf=32):
         super(Discriminator, self).__init__()
         self.in_channels = in_channels
         self.ndf = ndf
 
-        # Convolutional layers (using padding=1 to keep PatchGAN receptive fields consistent)
-        self.conv1 = nn.Conv2d(in_channels, ndf, kernel_size=4, stride=2, padding=1)
-        self.conv2 = nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1)
-        self.norm2 = nn.InstanceNorm2d(ndf * 2, affine=True)
+        # Convolutional layers (same configuration as original)
+        self.conv1 = nn.Conv2d(in_channels, ndf, kernel_size=4, stride=2)
+        self.conv2 = nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2)
+        self.conv4 = nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=1)
+        self.conv5 = nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1)
 
-        self.conv3 = nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2, padding=1)
-        self.norm3 = nn.InstanceNorm2d(ndf * 4, affine=True)
+        # Declare InstanceNorm layers once in __init__ to avoid recreating them each forward
+        self.norm2 = nn.InstanceNorm2d(ndf * 2, affine=False)
+        self.norm3 = nn.InstanceNorm2d(ndf * 4, affine=False)
+        self.norm4 = nn.InstanceNorm2d(ndf * 8, affine=False)
 
-        self.conv4 = nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=1, padding=1)
-        self.norm4 = nn.InstanceNorm2d(ndf * 8, affine=True)
+    def forward(self, x, threshold=0.2):
+        '''
+        Forward pass of the discriminator network.
 
-        self.conv5 = nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1, padding=1)
+        Args:
+            x (torch.Tensor): Input tensor.
+            threshold (float): Leaky ReLU threshold.
 
-        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
+        Returns:
+            torch.Tensor: Output tensor.
 
-    def forward(self, x):
-        '''Forward pass.'''
-        h = self.lrelu(self.conv1(x))
+        '''
+        h = self.conv1(x)
+        h = nn.functional.leaky_relu(h, threshold)
 
         h = self.conv2(h)
         h = self.norm2(h)
-        h = self.lrelu(h)
+        h = nn.functional.leaky_relu(h, threshold)
 
         h = self.conv3(h)
         h = self.norm3(h)
-        h = self.lrelu(h)
+        h = nn.functional.leaky_relu(h, threshold)
 
         h = self.conv4(h)
         h = self.norm4(h)
-        h = self.lrelu(h)
+        h = nn.functional.leaky_relu(h, threshold)
 
         h = self.conv5(h)
         return h
@@ -623,14 +720,13 @@ def train(
     D_F = Discriminator(1, d_channels).to(device)
     D_Q = Discriminator(1, d_channels).to(device)
 
+    # Image pools for discriminator history (CycleGAN paper suggests a small buffer, e.g. 50)
+    pool_F = ImagePool(pool_size=50)  # stores fake full images (x_QF)
+    pool_Q = ImagePool(pool_size=50)  # stores fake quarter images (x_FQ)
+
     # Make optimizers
     G_optim = torch.optim.Adam(itertools.chain(G_F2Q.parameters(), G_Q2F.parameters()), lr, betas=(beta1, beta2))
     D_optim = torch.optim.Adam(itertools.chain(D_F.parameters(), D_Q.parameters()), lr, betas=(beta1, beta2))
-
-    # Mixed precision scalers (enabled when CUDA is available)
-    use_amp = (device.type == 'cuda')
-    scaler_G = torch.cuda.amp.GradScaler(enabled=use_amp)
-    scaler_D = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     # Define loss functions
     adv_loss = nn.MSELoss()
@@ -646,6 +742,15 @@ def train(
                 'G_iden_loss_Q',
                 'D_adv_loss_F',
                 'D_adv_loss_Q']
+
+    # SSIM and gradient loss weights (additive to generator loss)
+    lambda_ssim = 1.0
+    lambda_grad = 1.0
+
+
+    # Mixed precision scalers
+    scaler_G = GradScaler()
+    scaler_D = GradScaler()
 
     if use_checkpoint:
         # If a checkpoint exists, load the state of the model and optimizer from the checkpoint
@@ -665,7 +770,12 @@ def train(
         
     # Set the initial trained epoch as 0
     trained_epoch = 0
-    
+
+    # Validation tracking
+    best_val_psnr = -1e9
+    val_psnr_list = []
+    val_ssim_list = []
+
     # Initialize a dictionary to store the losses
     losses_list = {name: list() for name in loss_name}
     print('Start from random initialized model')
@@ -680,12 +790,10 @@ def train(
             x_F = x_F.to(device)
             x_Q = x_Q.to(device)
 
-            # ------------------------
-            #  Train Generators (with AMP)
-            # ------------------------
+            # Set 'requires_grad' of the discriminators as 'False' to avoid computing gradients of the discriminators
             set_requires_grad([D_F, D_Q], False)
-
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            # Update generators: perform forward and loss computations under autocast
+            with autocast(enabled=torch.cuda.is_available()):
                 # Generate fake images using the generators
                 x_FQ = G_F2Q(x_F)
                 x_QF = G_Q2F(x_Q)
@@ -698,7 +806,7 @@ def train(
                 x_QQ = G_F2Q(x_Q)
                 x_FF = G_Q2F(x_F)
 
-                # Calculate adversarial losses (generators try to fool discriminators)
+                # Calculate adversarial losses (discriminator calls are inside autocast)
                 G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
                 G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
 
@@ -710,34 +818,63 @@ def train(
                 G_iden_loss_F = iden_loss(x_FF, x_F)
                 G_iden_loss_Q = iden_loss(x_QQ, x_Q)
 
-                # Total generator losses
+                # SSIM losses (1 - ssim so lower is better)
+                # ssim_torch expects images scaled to [0,1] (we assume inputs are already normalized)
+                G_ssim_F = 1.0 - ssim_torch(x_QF, x_F)
+                G_ssim_Q = 1.0 - ssim_torch(x_FQ, x_Q)
+
+                # Gradient losses (edge-aware)
+                G_grad_F = gradient_loss(x_QF, x_F)
+                G_grad_Q = gradient_loss(x_FQ, x_Q)
+
+                # Calculate total losses
                 G_adv_loss = G_adv_loss_F + G_adv_loss_Q
                 G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
                 G_iden_loss = G_iden_loss_F + G_iden_loss_Q
-                G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
+                G_ssim_loss = G_ssim_F + G_ssim_Q
+                G_grad_loss = G_grad_F + G_grad_Q
 
-            # Update the generators with scaled gradients
+                G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss) + lambda_ssim * (G_ssim_loss) + lambda_grad * (G_grad_loss)
+
+            # Update the generators (with GradScaler if available)
             G_optim.zero_grad()
-            scaler_G.scale(G_total_loss).backward()
-            scaler_G.step(G_optim)
-            scaler_G.update()
-
-            # ------------------------
-            #  Train Discriminators (with AMP)
-            # ------------------------
+            if scaler_G is not None:
+                scaler_G.scale(G_total_loss).backward()
+                scaler_G.step(G_optim)
+                scaler_G.update()
+            else:
+                G_total_loss.backward()
+                G_optim.step()
+            
+            # Set 'requires_grad' of the discriminators as 'True'
             set_requires_grad([D_F, D_Q], True)
+            # Calculate adversarial losses for the discriminators
+            # Use image pools (history) for generated images to stabilize discriminator training
+            fake_QF_for_D = pool_F.query(x_QF.detach())
+            fake_FQ_for_D = pool_Q.query(x_FQ.detach())
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
-                D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
-                D_total_loss_F = D_adv_loss_F / 2.0
-                D_total_loss_Q = D_adv_loss_Q / 2.0
-                D_total_loss = D_total_loss_F + D_total_loss_Q
+            with autocast(enabled=torch.cuda.is_available()):
+                real_F_out = D_F(x_F)
+                fake_F_out = D_F(fake_QF_for_D)
+                D_adv_loss_F = adv_loss(real_F_out, torch.ones_like(real_F_out)) + adv_loss(fake_F_out, torch.zeros_like(fake_F_out))
 
+                real_Q_out = D_Q(x_Q)
+                fake_Q_out = D_Q(fake_FQ_for_D)
+                D_adv_loss_Q = adv_loss(real_Q_out, torch.ones_like(real_Q_out)) + adv_loss(fake_Q_out, torch.zeros_like(fake_Q_out))
+
+            D_total_loss_F = D_adv_loss_F / 2.0
+            D_total_loss_Q = D_adv_loss_Q / 2.0
+
+            # Update the discriminators (with GradScaler if available)
             D_optim.zero_grad()
-            scaler_D.scale(D_total_loss).backward()
-            scaler_D.step(D_optim)
-            scaler_D.update()
+            D_total_loss = D_total_loss_F + D_total_loss_Q
+            if scaler_D is not None:
+                scaler_D.scale(D_total_loss).backward()
+                scaler_D.step(D_optim)
+                scaler_D.update()
+            else:
+                D_total_loss.backward()
+                D_optim.step()
 
             # Calculate the average loss during one epoch
             losses['G_adv_loss_F'](G_adv_loss_F.detach())
@@ -748,10 +885,38 @@ def train(
             losses['G_iden_loss_Q'](G_iden_loss_Q.detach())
             losses['D_adv_loss_F'](D_adv_loss_F.detach())
             losses['D_adv_loss_Q'](D_adv_loss_Q.detach())
-
+    
         for name in loss_name:
             losses_list[name].append(losses[name].result())
-        
+
+        # Validation evaluation (compute PSNR/SSIM on test set)
+        val_loader = make_dataloader(path_data, train_batch_size=1, is_train=False)
+        G_F2Q.eval(); G_Q2F.eval()
+        psnr_vals = []
+        ssim_vals = []
+        with torch.no_grad():
+            for v_F, v_Q, _ in val_loader:
+                v_F = v_F.to(device); v_Q = v_Q.to(device)
+                pred = G_Q2F(v_Q)
+                pred_np = pred.squeeze().cpu().numpy()
+                ref_np = v_F.squeeze().cpu().numpy()
+                psnr_vals.append(psnr(pred_np.copy(), ref_np.copy()))
+                ssim_vals.append(ssim(pred_np.copy(), ref_np.copy()))
+        avg_psnr = float(np.mean(psnr_vals)) if len(psnr_vals) > 0 else 0.0
+        avg_ssim = float(np.mean(ssim_vals)) if len(ssim_vals) > 0 else 0.0
+        val_psnr_list.append(avg_psnr)
+        val_ssim_list.append(avg_ssim)
+
+        # Save best model by validation PSNR
+        if avg_psnr > best_val_psnr:
+            best_val_psnr = avg_psnr
+            torch.save({'epoch': epoch + 1, 'G_F2Q_state_dict': G_F2Q.state_dict(), 'G_Q2F_state_dict': G_Q2F.state_dict(),
+                        'D_F_state_dict': D_F.state_dict(), 'D_Q_state_dict': D_Q.state_dict(),
+                        'G_optim_state_dict': G_optim.state_dict(), 'D_optim_state_dict': D_optim.state_dict()},
+                       join(path_checkpoint, model_name + '_best.pth'))
+        G_F2Q.train(); G_Q2F.train()
+        G_F2Q.train(); G_Q2F.train()
+
         # Save the trained model and list of losses
         torch.save({'epoch': epoch + 1, 'G_F2Q_state_dict': G_F2Q.state_dict(), 'G_Q2F_state_dict': G_Q2F.state_dict(),
                         'D_F_state_dict': D_F.state_dict(), 'D_Q_state_dict': D_Q.state_dict(),
@@ -759,7 +924,15 @@ def train(
         for name in loss_name:
             torch.save(losses_list[name], join(path_result, name + '.npy'))
             
-    # Plot loss graph (adversarial loss)
+        # Save validation metrics if they exist
+        try:
+            np.save(join(path_result, 'val_psnr.npy'), np.array(val_psnr_list))
+            np.save(join(path_result, 'val_ssim.npy'), np.array(val_ssim_list))
+        except NameError:
+            # validation lists not defined yet; skip
+            pass
+
+        # Plot loss graph (adversarial loss)
     plt.figure(1)
     for name in ['G_adv_loss_F', 'G_adv_loss_Q', 'D_adv_loss_F', 'D_adv_loss_Q']:
         loss_arr = torch.load(join(path_result, name + '.npy'), map_location='cpu')
@@ -786,7 +959,7 @@ def train(
     plt.savefig(join(path_result, 'loss_curve_2.png'))
     plt.close() 
     
-    
+
 if __name__ == '__main__':
     # Parse arguments
     parser = argparse.ArgumentParser()
