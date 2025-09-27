@@ -4,11 +4,13 @@ import argparse
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+from multiprocessing import cpu_count
 
 from os import listdir, makedirs
 from os.path import isdir, join 
@@ -17,6 +19,7 @@ from torch.nn import init
 
 from tqdm.auto import tqdm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+from torch.cuda.amp import autocast, GradScaler
 
 
 # Functions for calculating PSNR, SSIM
@@ -68,6 +71,69 @@ def ssim(A, ref):
     # structural_similarity expects 2D arrays and a proper data_range
     return structural_similarity(ref_n, A_n, data_range=1.0)
 
+
+# Torch-based SSIM (differentiable) and gradient loss for training
+import math
+
+def _gaussian(window_size, sigma):
+    gauss = torch.Tensor([math.exp(-(x - window_size//2)**2/(2*sigma**2)) for x in range(window_size)])
+    return gauss / gauss.sum()
+
+
+def create_window(window_size, channel):
+    _1D = _gaussian(window_size, 1.5).unsqueeze(1)
+    _2D = _1D.mm(_1D.t()).float().unsqueeze(0).unsqueeze(0)
+    window = _2D.expand(channel, 1, window_size, window_size).contiguous()
+    return window
+
+
+def ssim_torch(img1, img2, window_size=11, val_range=1.0):
+    """
+    Compute mean SSIM over batch using a Gaussian window. Returns a scalar in [-1,1].
+    Assumes img1 and img2 are torch tensors shaped (B, C, H, W) and scaled to [0, val_range].
+    """
+    (_, channel, _, _) = img1.size()
+    window = create_window(window_size, channel).to(img1.device).type(img1.dtype)
+
+    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=channel) - mu1_mu2
+
+    C1 = (0.01 * val_range) ** 2
+    C2 = (0.03 * val_range) ** 2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean()
+
+
+def gradient_loss(pred, target):
+    """
+    L1 loss between image gradients (Sobel) of pred and target. Works on BxCxHxW tensors.
+    """
+    # Sobel kernels
+    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=pred.device, dtype=pred.dtype).view(1, 1, 3, 3)
+    sobel_y = sobel_x.permute(0, 1, 3, 2)
+
+    channels = pred.shape[1]
+    sobel_x = sobel_x.repeat(channels, 1, 1, 1)
+    sobel_y = sobel_y.repeat(channels, 1, 1, 1)
+
+    grad_pred_x = F.conv2d(pred, sobel_x, padding=1, groups=channels)
+    grad_pred_y = F.conv2d(pred, sobel_y, padding=1, groups=channels)
+    grad_target_x = F.conv2d(target, sobel_x, padding=1, groups=channels)
+    grad_target_y = F.conv2d(target, sobel_y, padding=1, groups=channels)
+
+    loss = (grad_pred_x - grad_target_x).abs().mean() + (grad_pred_y - grad_target_y).abs().mean()
+    return loss
+
+
 # Initialize parameters of neural networks
 def init_weights(net):
     def init_func(m):
@@ -106,6 +172,50 @@ class Mean:
     
     def result(self):
         return self.mean
+
+
+# Image pool for storing previously generated images (used to update discriminator)
+class ImagePool:
+    """Initialize an image buffer that stores previously generated images.
+
+    This buffer enables the discriminator to be trained on a history of generated images
+    rather than only the most recent ones, which stabilizes GAN training (CycleGAN trick).
+    """
+    def __init__(self, pool_size=50):
+        self.pool_size = int(pool_size)
+        if self.pool_size > 0:
+            self.num_imgs = 0
+            self.images = []
+
+    def query(self, images):
+        """
+        Return images for discriminator training. Accepts a batch tensor (B,C,H,W).
+        For each image in the batch: if the pool isn't full, store and return image.
+        Otherwise, with probability 0.5 return a previously stored image (and replace it with the new one),
+        or return the new image directly.
+        """
+        if self.pool_size == 0:
+            return images
+
+        return_images = []
+        for img in images:
+            img = img.unsqueeze(0)
+            if self.num_imgs < self.pool_size:
+                # store and return
+                self.images.append(img.clone().detach())
+                self.num_imgs += 1
+                return_images.append(img)
+            else:
+                if random.random() > 0.5:
+                    # use previously stored image
+                    idx = random.randint(0, self.pool_size - 1)
+                    tmp = self.images[idx].clone().detach()
+                    # replace the stored image with the new one
+                    self.images[idx] = img.clone().detach()
+                    return_images.append(tmp)
+                else:
+                    return_images.append(img)
+        return torch.cat(return_images, dim=0)
 
 
 # CT dataset
@@ -206,9 +316,30 @@ class RandomCrop(object):
 
 
 # Make dataloader for training/test
-def make_dataloader(path, train_batch_size=1, is_train=True):
-    # Path of 'train' and 'test' folders    
+def make_dataloader(path, train_batch_size=1, is_train=True, num_workers=None):
+    """
+    Create a DataLoader for training or testing.
+
+    Small I/O improvements:
+    - Automatically choose a sensible number of workers (defaults to cpu_count()-1 up to 4).
+    - Use pin_memory only when CUDA is available.
+    - Enable persistent_workers when num_workers>0 to avoid worker spawn overhead each epoch.
+    - Set a small prefetch_factor when using multiple workers.
+    """
+    # Path of 'train' and 'test' folders
     dataset_path = join(path, 'train') if is_train else join(path, 'test')
+
+    # Choose number of workers if not explicitly provided
+    if num_workers is None:
+        try:
+            n_workers = max(0, min(4, cpu_count() - 1))
+        except Exception:
+            n_workers = 2
+    else:
+        n_workers = max(0, int(num_workers))
+
+    pin_memory = torch.cuda.is_available()
+    persistent = True if n_workers > 0 else False
 
     # Transform for training data: convert to tensor, random horizontal/verical flip, random crop
     if is_train:
@@ -219,66 +350,91 @@ def make_dataloader(path, train_batch_size=1, is_train=True):
             RandomCrop(128)
         ])
         train_dataset = CT_Dataset(dataset_path, train_transform)
-        dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, num_workers=0, pin_memory=True)
+        dataloader = DataLoader(
+            train_dataset,
+            batch_size=train_batch_size,
+            shuffle=True,
+            num_workers=n_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent,
+            prefetch_factor=2 if n_workers > 0 else 2
+        )
     else:
         test_transform = torchvision.transforms.Compose([
             torchvision.transforms.ToTensor()
         ])
 
         test_dataset = CT_Dataset(dataset_path, test_transform)
-        dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+        dataloader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=n_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent
+        )
 
     return dataloader
 
   
 
-class ResnetBlock(nn.Module):
-    '''
-    Residual block
-    
-    This class represents a residual block in a ResNet architecture. It consists of two convolutional layers
-    with batch normalization and ReLU activation functions, and a shortcut connection to handle the case when
-    the input and output channels are different.
-    
-    Args:
-        in_channels (int): The number of input channels.
-        out_channels (int, optional): The number of output channels. If not specified, it is set to the same
-            as the input channels.
-        dropout (float, optional): The dropout rate. Default is 0.5.
-        num_groups (int, optional): The number of groups to separate the channels into for group normalization.
-            Default is 16.
-    '''
-    def __init__(self, in_channels, out_channels=None, num_groups=16):
-        super(ResnetBlock, self).__init__()
-        self.in_channels = in_channels
-        out_channels = in_channels if out_channels is None else out_channels
-        self.out_channels = out_channels
-
-        # Group normalization layer and convolutional layer
-        self.norm1 = torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
-        self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-
-        self.norm2 = torch.nn.GroupNorm(num_groups=num_groups, num_channels=out_channels, eps=1e-6, affine=True)
-        self.conv2 = torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        
-        # Shortcut connection
-        self.shortcut = torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+class DenseLayer(nn.Module):
+    """
+    Single dense layer used inside a DenseBlock. Takes input features and produces growth_channels features,
+    then concatenates them to the input (DenseNet-style).
+    """
+    def __init__(self, in_channels, growth_channels):
+        super(DenseLayer, self).__init__()
+        self.conv = nn.Conv2d(in_channels, growth_channels, kernel_size=3, stride=1, padding=1)
+        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
-        h = x
-        h = self.norm1(h)
-        h = F.relu(h, inplace=True)
-        h = self.conv1(h)
-        
-        h = self.norm2(h)
-        h = F.relu(h, inplace=True)
-        h = self.conv2(h)
+        out = self.lrelu(self.conv(x))
+        return torch.cat([x, out], dim=1)
 
-        if self.in_channels != self.out_channels:
-            x = self.shortcut(x)
 
-        return x + h
+class DenseBlock(nn.Module):
+    """
+    Dense block composed of several DenseLayer layers. After growth layers, a 1x1 conv (local feature fusion)
+    reduces the concatenated channels back to the input channels so the block has a residual-friendly shape.
+    """
+    def __init__(self, in_channels, growth_channels=32, num_layers=5):
+        super(DenseBlock, self).__init__()
+        self.num_layers = int(num_layers)
+        self.growth = int(growth_channels)
+        self.layers = nn.ModuleList()
+        ch = in_channels
+        for i in range(self.num_layers):
+            self.layers.append(DenseLayer(ch, self.growth))
+            ch += self.growth
+        # local feature fusion: reduce ch -> in_channels
+        self.lff = nn.Conv2d(ch, in_channels, kernel_size=1, stride=1, padding=0)
 
+    def forward(self, x):
+        out = x
+        for layer in self.layers:
+            out = layer(out)
+        out = self.lff(out)
+        return out
+
+
+class RRDB(nn.Module):
+    """
+    Residual-in-Residual Dense Block (RRDB) as used in ESRGAN / RRDBNet.
+    It stacks `num_blocks` DenseBlocks and applies a residual-scaling to the dense output
+    before adding back to the input: out = x + res_scale * F(x)
+    Defaults reduced for lower compute: growth_channels=16, num_layers=3, num_blocks=2.
+    """
+    def __init__(self, channels, growth_channels=16, num_layers=3, num_blocks=2, res_scale=0.2):
+        super(RRDB, self).__init__()
+        self.blocks = nn.ModuleList([DenseBlock(channels, growth_channels, num_layers) for _ in range(num_blocks)])
+        self.res_scale = float(res_scale)
+
+    def forward(self, x):
+        out = x
+        for b in self.blocks:
+            out = b(out)
+        return x + out * self.res_scale
 
 class Upsample(nn.Module):
     '''
@@ -361,119 +517,130 @@ class Downsample(nn.Module):
         return x
 
 class Generator(nn.Module):
-    '''
-    Generator class for the CycleGAN model.
-    
-    Args:
-        in_channels (int): The number of channels of the input.
-        out_channels (int): The number of channels of the output.
-        ngf (int): The number of convolution filters of the first layer.
-        ch_mult (tuple): The channel multiplier for each resolution level. Default is (1, 2, 4, 8).
-        num_res_blocks (int): The number of residual blocks in each resolution level. Default is 3.
-    '''
-    
-    def __init__(self, in_channels, out_channels, ngf, ch_mult=(1, 2, 4, 8), num_res_blocks=3):
+    """
+    Simplified encoder-decoder Generator using RRDB blocks and single skip connection per scale.
+
+    Structure:
+      - conv_in -> down_blocks (RRDBs + optional Downsample)
+      - mid_block (RRDB)
+      - up_blocks: for each scale, (optional Upsample) -> concat with corresponding encoder skip -> 1x1 reduce -> RRDBs
+      - conv_out + global residual
+    """
+    def __init__(self, in_channels, out_channels, ngf, ch_mult=(1, 2, 4, 8), num_res_blocks=3, rrdb_gc=16, rrdb_num_layers=3, rrdb_num_blocks=2):
         super(Generator, self).__init__()
-        
-        # Check if the number of input channels is equal to the number of output channels
         assert in_channels == out_channels, 'The number of input channels should be equal to the number of output channels.'
+
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.ngf = ngf
-        
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
+        # RRDB configuration (reduced for compute)
+        self.rrdb_gc = rrdb_gc
+        self.rrdb_num_layers = rrdb_num_layers
+        self.rrdb_num_blocks = rrdb_num_blocks
 
-        # Initialize the lists of upsample and downsample blocks
-        self.up_blocks = nn.ModuleList()
         self.down_blocks = nn.ModuleList()
-        self.mid_block = nn.Module()
 
-        # The first layer of the generator
+        # initial conv
         self.conv_in = nn.Conv2d(in_channels, ngf, kernel_size=3, stride=1, padding=1)
-    
-        # Initialize the number of input channels for each resolution level
-        in_ch_mult = (1,) + tuple(ch_mult)
 
-        # Define the downsample and upsample blocks
+        # Build down blocks: for each level, optionally expand channels with 1x1, apply several RRDBs,
+        # and optionally downsample at the end.
+        in_ch_mult = (1,) + tuple(ch_mult)
         for level in range(self.num_resolutions):
-            down_block = nn.ModuleList()
-            # The number of input and output channels for the current block
+            layers = nn.ModuleList()
             block_in_channels = ngf * in_ch_mult[level]
             block_out_channels = ngf * ch_mult[level]
 
+            # channel expansion if needed
+            if block_in_channels != block_out_channels:
+                layers.append(nn.Conv2d(block_in_channels, block_out_channels, kernel_size=1, stride=1, padding=0))
+                block_in_channels = block_out_channels
+
+            # RRDBs (use reduced complexity params)
             for _ in range(self.num_res_blocks):
-                # Add a residual block to the downsample block
-                down_block.append(ResnetBlock(block_in_channels, block_out_channels))
-                block_in_channels = block_out_channels
-        
+                layers.append(RRDB(block_in_channels, growth_channels=min(self.rrdb_gc, max(8, block_in_channels // 4)), num_layers=self.rrdb_num_layers, num_blocks=self.rrdb_num_blocks))
+
+            # downsample except for last level
             if level != self.num_resolutions - 1:
-                # Add a downsample block to the downsample blocks list
-                down_block.append(Downsample(block_out_channels))
+                layers.append(Downsample(block_out_channels))
 
-            self.down_blocks.append(down_block)
+            self.down_blocks.append(layers)
 
-        # The middle block of the generator
-        self.mid_block = ResnetBlock(ngf * ch_mult[-1], ngf * ch_mult[-1])
+        # bottleneck (reduced RRDB)
+        self.mid_block = RRDB(ngf * ch_mult[-1], growth_channels=min(self.rrdb_gc, max(8, (ngf * ch_mult[-1]) // 4)), num_layers=self.rrdb_num_layers, num_blocks=self.rrdb_num_blocks)
+
+        # Build up blocks: at each level we will (optionally) upsample, concatenate with corresponding skip, reduce channels,
+        # and apply RRDBs. We'll store them so forward pass can run deterministically.
+        self.up_blocks = nn.ModuleList()
+        prev_channels = ngf * ch_mult[-1]
+        # encoder channel sizes (skip features) in order of append during down pass
+        encoder_channels = [ngf] + [ngf * m for m in ch_mult]
 
         for level in reversed(range(self.num_resolutions)):
-            up_block = nn.ModuleList()
-            # The number of input and output channels for the current block
-            block_in_channels = ngf * ch_mult[level]
-            block_out_channels = ngf * ch_mult[level]
-            block_skip_channels = ngf * ch_mult[level]
+            layers = nn.ModuleList()
+            # If not the deepest level, we need to upsample previous output first
+            if level != self.num_resolutions - 1:
+                layers.append(Upsample(prev_channels, out_channels=prev_channels))
 
-            for block_idx in range(self.num_res_blocks + 1):
-                if block_idx == self.num_res_blocks:
-                    # If this is the last block, add a residual block with skip connections
-                    block_skip_channels = ngf * in_ch_mult[level]
-                    block_out_channels = ngf * in_ch_mult[level]
-                # Add a residual block to the upsample block
-                up_block.append(ResnetBlock(block_in_channels + block_skip_channels, block_out_channels))
-                block_in_channels = block_out_channels
+            skip_channels = encoder_channels[level + 1]
+            concat_ch = prev_channels + skip_channels
+            out_ch = ngf * ch_mult[level]
+            # conv to reduce concatenated channels back to the desired out_ch
+            layers.append(nn.Conv2d(concat_ch, out_ch, kernel_size=1, stride=1, padding=0))
+            # followed by several RRDBs operating at out_ch
+            for _ in range(self.num_res_blocks):
+                layers.append(RRDB(out_ch, growth_channels=min(self.rrdb_gc, max(8, out_ch // 4)), num_layers=self.rrdb_num_layers, num_blocks=self.rrdb_num_blocks))
 
-            if level != 0:
-                up_block.append(Upsample(block_out_channels))
-            
-            self.up_blocks.insert(0, up_block)
+            prev_channels = out_ch
+            # prepend since we iterate reversed and want up_blocks[0] to correspond to the first up level
+            self.up_blocks.insert(0, layers)
 
-        self.conv_out = torch.nn.Conv2d(ngf, out_channels, kernel_size=3, stride=1, padding=1)
-    
+        self.conv_out = nn.Conv2d(ngf, out_channels, kernel_size=3, stride=1, padding=1)
+
     def forward(self, x):
-        '''
-        Forward pass of the CycleGAN model.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor after passing through the model.
-        '''
-        # Store the input tensor as the skip connection
-        hs = [self.conv_in(x)]
-
-        # Pass the input tensor through the downsample blocks
+        # Encoder: store skip connections BEFORE downsampling so they match the upsampled shapes later
+        skips = []
+        h = self.conv_in(x)
         for level in range(self.num_resolutions):
-            for block in self.down_blocks[level]:
-                h = block(hs[-1])
-                # Store the output tensor of the residual block to the skip connections list
-                hs.append(h)
+            layers = self.down_blocks[level]
+            # if last layer is Downsample, apply all but last, store skip, then downsample for next level
+            if len(layers) > 0 and isinstance(layers[-1], Downsample):
+                for layer in layers[:-1]:
+                    h = layer(h)
+                skips.append(h)
+                h = layers[-1](h)
+            else:
+                for layer in layers:
+                    h = layer(h)
+                skips.append(h)
 
-        h = self.mid_block(hs[-1])
+        # Bottleneck
+        h = self.mid_block(h)
 
-        # Pass the input tensor through the upsample blocks
-        for level in reversed(range(self.num_resolutions)):
-            for block in self.up_blocks[level]:
-                if not isinstance(block, Upsample):
-                    # If the block is not an upsample block, concatenate the skip connection
-                    h = torch.cat([h, hs.pop()], dim=1)
-                h = block(h)
-        
+        # Decoder / up path: for each level, optionally upsample, concat with corresponding skip, reduce and RRDBs
+        for level in range(self.num_resolutions - 1, -1, -1):
+            layers = self.up_blocks[level]
+            idx = 0
+            if isinstance(layers[0], Upsample):
+                h = layers[0](h)
+                idx = 1
+            # pop corresponding skip (the last appended)
+            skip = skips.pop()
+            # concatenate and reduce
+            h = torch.cat([h, skip], dim=1)
+            h = layers[idx](h)
+            # remaining layers are RRDBs
+            for layer in layers[idx + 1:]:
+                h = layer(h)
+
         h = self.conv_out(h)
+        # global residual connection
         h = h + x
-        
         return h
-  
+
+# Discriminator (PatchGAN)
 # Discriminator (PatchGAN)
 class Discriminator(nn.Module):
     '''
@@ -574,6 +741,10 @@ def train(
     D_F = Discriminator(1, d_channels).to(device)
     D_Q = Discriminator(1, d_channels).to(device)
 
+    # Image pools for discriminator history (CycleGAN paper suggests a small buffer, e.g. 50)
+    pool_F = ImagePool(pool_size=50)  # stores fake full images (x_QF)
+    pool_Q = ImagePool(pool_size=50)  # stores fake quarter images (x_FQ)
+
     # Make optimizers
     G_optim = torch.optim.Adam(itertools.chain(G_F2Q.parameters(), G_Q2F.parameters()), lr, betas=(beta1, beta2))
     D_optim = torch.optim.Adam(itertools.chain(D_F.parameters(), D_Q.parameters()), lr, betas=(beta1, beta2))
@@ -592,6 +763,15 @@ def train(
                 'G_iden_loss_Q',
                 'D_adv_loss_F',
                 'D_adv_loss_Q']
+
+    # SSIM and gradient loss weights (additive to generator loss)
+    lambda_ssim = 1.0
+    lambda_grad = 1.0
+
+
+    # Mixed precision scalers
+    scaler_G = GradScaler()
+    scaler_D = GradScaler()
 
     if use_checkpoint:
         # If a checkpoint exists, load the state of the model and optimizer from the checkpoint
@@ -633,56 +813,89 @@ def train(
 
             # Set 'requires_grad' of the discriminators as 'False' to avoid computing gradients of the discriminators
             set_requires_grad([D_F, D_Q], False)
+            # Update generators: perform forward and loss computations under autocast
+            with autocast(enabled=torch.cuda.is_available()):
+                # Generate fake images using the generators
+                x_FQ = G_F2Q(x_F)
+                x_QF = G_Q2F(x_Q)
 
-            # Generate fake images using the generators
-            x_FQ = G_F2Q(x_F)
-            x_QF = G_Q2F(x_Q)
-            
-            # Generate cyclic images using the generators
-            x_QFQ = G_F2Q(x_QF)
-            x_FQF = G_Q2F(x_FQ)
-            
-            # Generate identity images using the generators
-            x_QQ = G_F2Q(x_Q)
-            x_FF = G_Q2F(x_F)
+                # Generate cyclic images using the generators
+                x_QFQ = G_F2Q(x_QF)
+                x_FQF = G_Q2F(x_FQ)
 
-            # Calculate adversarial losses
-            G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
-            G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
-            
-            # Calculate cycle losses
-            G_cycle_loss_F = cycle_loss(x_FQF, x_F)
-            G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
-            
-            # Calculate identity losses
-            G_iden_loss_F = iden_loss(x_FF, x_F)
-            G_iden_loss_Q = iden_loss(x_QQ, x_Q)
-            
-            # Calculate total losses
-            G_adv_loss = G_adv_loss_F + G_adv_loss_Q
-            G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
-            G_iden_loss = G_iden_loss_F + G_iden_loss_Q
-            G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
+                # Generate identity images using the generators
+                x_QQ = G_F2Q(x_Q)
+                x_FF = G_Q2F(x_F)
 
-            # Update the generators
+                # Calculate adversarial losses (discriminator calls are inside autocast)
+                G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
+                G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
+
+                # Calculate cycle losses
+                G_cycle_loss_F = cycle_loss(x_FQF, x_F)
+                G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
+
+                # Calculate identity losses
+                G_iden_loss_F = iden_loss(x_FF, x_F)
+                G_iden_loss_Q = iden_loss(x_QQ, x_Q)
+
+                # SSIM losses (1 - ssim so lower is better)
+                # ssim_torch expects images scaled to [0,1] (we assume inputs are already normalized)
+                G_ssim_F = 1.0 - ssim_torch(x_QF, x_F)
+                G_ssim_Q = 1.0 - ssim_torch(x_FQ, x_Q)
+
+                # Gradient losses (edge-aware)
+                G_grad_F = gradient_loss(x_QF, x_F)
+                G_grad_Q = gradient_loss(x_FQ, x_Q)
+
+                # Calculate total losses
+                G_adv_loss = G_adv_loss_F + G_adv_loss_Q
+                G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
+                G_iden_loss = G_iden_loss_F + G_iden_loss_Q
+                G_ssim_loss = G_ssim_F + G_ssim_Q
+                G_grad_loss = G_grad_F + G_grad_Q
+
+                G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss) + lambda_ssim * (G_ssim_loss) + lambda_grad * (G_grad_loss)
+
+            # Update the generators (with GradScaler if available)
             G_optim.zero_grad()
-            G_total_loss.backward()
-            G_optim.step()
+            if scaler_G is not None:
+                scaler_G.scale(G_total_loss).backward()
+                scaler_G.step(G_optim)
+                scaler_G.update()
+            else:
+                G_total_loss.backward()
+                G_optim.step()
             
             # Set 'requires_grad' of the discriminators as 'True'
             set_requires_grad([D_F, D_Q], True)
-
             # Calculate adversarial losses for the discriminators
-            D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
-            D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
+            # Use image pools (history) for generated images to stabilize discriminator training
+            fake_QF_for_D = pool_F.query(x_QF.detach())
+            fake_FQ_for_D = pool_Q.query(x_FQ.detach())
+
+            with autocast(enabled=torch.cuda.is_available()):
+                real_F_out = D_F(x_F)
+                fake_F_out = D_F(fake_QF_for_D)
+                D_adv_loss_F = adv_loss(real_F_out, torch.ones_like(real_F_out)) + adv_loss(fake_F_out, torch.zeros_like(fake_F_out))
+
+                real_Q_out = D_Q(x_Q)
+                fake_Q_out = D_Q(fake_FQ_for_D)
+                D_adv_loss_Q = adv_loss(real_Q_out, torch.ones_like(real_Q_out)) + adv_loss(fake_Q_out, torch.zeros_like(fake_Q_out))
+
             D_total_loss_F = D_adv_loss_F / 2.0
             D_total_loss_Q = D_adv_loss_Q / 2.0
 
-            # Update the discriminators
+            # Update the discriminators (with GradScaler if available)
             D_optim.zero_grad()
-            D_total_loss_F.backward()
-            D_total_loss_Q.backward()
-            D_optim.step()
+            D_total_loss = D_total_loss_F + D_total_loss_Q
+            if scaler_D is not None:
+                scaler_D.scale(D_total_loss).backward()
+                scaler_D.step(D_optim)
+                scaler_D.update()
+            else:
+                D_total_loss.backward()
+                D_optim.step()
 
             # Calculate the average loss during one epoch
             losses['G_adv_loss_F'](G_adv_loss_F.detach())
