@@ -139,7 +139,7 @@ def test(
 if __name__ == '__main__':
     # Parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('--path_checkpoint', type=str, default='./CT_denoising')
+    parser.add_argument('--path_checkpoint', type=str, default='./test_results')
     parser.add_argument('--model_name', type=str, default='cyclegan_v1')
     parser.add_argument('--path_data', type=str, default='./AAPM_data')
     parser.add_argument('--g_channels', type=int, default=32)
