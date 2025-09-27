@@ -14,6 +14,7 @@ from os import listdir, makedirs
 from os.path import isdir, join 
 from torch.utils.data import Dataset, DataLoader
 from torch.nn import init
+from torch.cuda.amp import autocast, GradScaler
 
 from tqdm.auto import tqdm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
@@ -173,52 +174,82 @@ def make_dataloader(path, train_batch_size=1, is_train=True):
 
   
 
-class ResnetBlock(nn.Module):
-    '''
-    Residual block
-    
-    This class represents a residual block in a ResNet architecture. It consists of two convolutional layers
-    with batch normalization and ReLU activation functions, and a shortcut connection to handle the case when
-    the input and output channels are different.
-    
-    Args:
-        in_channels (int): The number of input channels.
-        out_channels (int, optional): The number of output channels. If not specified, it is set to the same
-            as the input channels.
-        dropout (float, optional): The dropout rate. Default is 0.5.
-        num_groups (int, optional): The number of groups to separate the channels into for group normalization.
-            Default is 16.
-    '''
-    def __init__(self, in_channels, out_channels=None, num_groups=16):
-        super(ResnetBlock, self).__init__()
-        self.in_channels = in_channels
-        out_channels = in_channels if out_channels is None else out_channels
-        self.out_channels = out_channels
-
-        # Group normalization layer and convolutional layer
-        self.norm1 = torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
-        self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-
-        self.norm2 = torch.nn.GroupNorm(num_groups=num_groups, num_channels=out_channels, eps=1e-6, affine=True)
-        self.conv2 = torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        
-        # Shortcut connection
-        self.shortcut = torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+class ResidualDenseBlock(nn.Module):
+    """
+    A small Residual Dense Block (RDB) used inside RRDB.
+    Uses 3 conv layers with dense connections and a local residual.
+    """
+    def __init__(self, in_channels, growth_channels=32):
+        super(ResidualDenseBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, growth_channels, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(in_channels + growth_channels, growth_channels, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(in_channels + 2 * growth_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
-        h = x
-        h = self.norm1(h)
-        h = F.relu(h, inplace=True)
-        h = self.conv1(h)
-        
-        h = self.norm2(h)
-        h = F.relu(h, inplace=True)
+        c1 = self.lrelu(self.conv1(x))
+        c2 = self.lrelu(self.conv2(torch.cat([x, c1], dim=1)))
+        c3 = self.conv3(torch.cat([x, c1, c2], dim=1))
+        # local residual scaling
+        return x + 0.2 * c3
+
+
+class RRDB(nn.Module):
+    """
+    Residual-in-Residual Dense Block (RRDB).
+    Stacks several ResidualDenseBlock modules with an outer residual connection.
+
+    This RRDB accepts an optional `out_channels` argument. If `out_channels` differs from
+    `in_channels` a 1x1 convolution is applied at the end to match the desired number of channels.
+    """
+    def __init__(self, in_channels, growth_channels=32, num_rdb=3, out_channels=None):
+        super(RRDB, self).__init__()
+        self.in_channels = in_channels
+        self.growth_channels = growth_channels
+        self.rdbs = nn.Sequential(*[ResidualDenseBlock(in_channels, growth_channels) for _ in range(num_rdb)])
+        self.scale = 0.2
+        # If out_channels is provided and different from in_channels, use a 1x1 conv to map channels
+        if out_channels is None or out_channels == in_channels:
+            self.match_conv = None
+        else:
+            self.match_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        out = x + self.scale * self.rdbs(x)
+        if self.match_conv is not None:
+            out = self.match_conv(out)
+        return out
+
+
+# Lightweight residual block for encoder/decoder (cheap replacement for RRDB)
+class SimpleResBlock(nn.Module):
+    """A lightweight residual block used in encoder/decoder to save compute.
+
+    It supports changing the number of channels via a 1x1 projection when
+    in_channels != out_channels and uses a small residual scale to stabilise training.
+    """
+    def __init__(self, in_channels, out_channels=None):
+        super(SimpleResBlock, self).__init__()
+        if out_channels is None:
+            out_channels = in_channels
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        if in_channels != out_channels:
+            self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+        else:
+            self.proj = None
+
+    def forward(self, x):
+        h = self.act(self.conv1(x))
         h = self.conv2(h)
-
-        if self.in_channels != self.out_channels:
-            x = self.shortcut(x)
-
-        return x + h
+        if self.proj is not None:
+            res = self.proj(x)
+        else:
+            res = x
+        return res + 0.1 * h
 
 
 class Upsample(nn.Module):
@@ -345,7 +376,7 @@ class Generator(nn.Module):
 
             for _ in range(self.num_res_blocks):
                 # Add a residual block to the downsample block
-                down_block.append(ResnetBlock(block_in_channels, block_out_channels))
+                down_block.append(SimpleResBlock(block_in_channels, block_out_channels))
                 block_in_channels = block_out_channels
         
             if level != self.num_resolutions - 1:
@@ -355,7 +386,7 @@ class Generator(nn.Module):
             self.down_blocks.append(down_block)
 
         # The middle block of the generator
-        self.mid_block = ResnetBlock(ngf * ch_mult[-1], ngf * ch_mult[-1])
+        self.mid_block = RRDB(ngf * ch_mult[-1], growth_channels=16, num_rdb=1, out_channels=ngf * ch_mult[-1])
 
         for level in reversed(range(self.num_resolutions)):
             up_block = nn.ModuleList()
@@ -370,7 +401,7 @@ class Generator(nn.Module):
                     block_skip_channels = ngf * in_ch_mult[level]
                     block_out_channels = ngf * in_ch_mult[level]
                 # Add a residual block to the upsample block
-                up_block.append(ResnetBlock(block_in_channels + block_skip_channels, block_out_channels))
+                up_block.append(SimpleResBlock(block_in_channels + block_skip_channels, block_out_channels))
                 block_in_channels = block_out_channels
 
             if level != 0:
@@ -446,6 +477,12 @@ class Discriminator(nn.Module):
         self.conv3 = nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2)
         self.conv4 = nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=1)
         self.conv5 = nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1)
+
+        # Register InstanceNorm layers properly (created once in __init__)
+        # Using affine=False (default) for standard InstanceNorm behavior in PatchGAN.
+        self.norm2 = nn.InstanceNorm2d(ndf * 2, affine=False)
+        self.norm3 = nn.InstanceNorm2d(ndf * 4, affine=False)
+        self.norm4 = nn.InstanceNorm2d(ndf * 8, affine=False)
     
     def forward(self, x, threshold=0.2):
         '''
@@ -460,19 +497,19 @@ class Discriminator(nn.Module):
 
         '''
         h = self.conv1(x)
-        h = nn.functional.leaky_relu(h, threshold)
+        h = F.leaky_relu(h, threshold)
 
         h = self.conv2(h)
-        h = nn.InstanceNorm2d(h.size(1))(h)
-        h = nn.functional.leaky_relu(h, threshold)
+        h = self.norm2(h)
+        h = F.leaky_relu(h, threshold)
 
         h = self.conv3(h)
-        h = nn.InstanceNorm2d(h.size(1))(h)
-        h = nn.functional.leaky_relu(h, threshold)
+        h = self.norm3(h)
+        h = F.leaky_relu(h, threshold)
 
         h = self.conv4(h)
-        h = nn.InstanceNorm2d(h.size(1))(h)
-        h = nn.functional.leaky_relu(h, threshold)
+        h = self.norm4(h)
+        h = F.leaky_relu(h, threshold)
 
         h = self.conv5(h)
         return h
@@ -494,8 +531,15 @@ def train(
     ch_mult=[1, 2, 4, 8],
     num_res_blocks=3,
     lr=2e-4,
-    use_checkpoint=False
+    trained_epoch = 0,
+    use_checkpoint=False,
+    use_amp=False
 ):
+
+    # Initialize AMP scaler if requested and CUDA is available
+    scaler = GradScaler() if (use_amp and torch.cuda.is_available()) else None
+
+    # Initialize a dictionary to store the losses:
     # Hyperparameters
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -574,55 +618,104 @@ def train(
             # Set 'requires_grad' of the discriminators as 'False' to avoid computing gradients of the discriminators
             set_requires_grad([D_F, D_Q], False)
 
-            # Generate fake images using the generators
-            x_FQ = G_F2Q(x_F)
-            x_QF = G_Q2F(x_Q)
-            
-            # Generate cyclic images using the generators
-            x_QFQ = G_F2Q(x_QF)
-            x_FQF = G_Q2F(x_FQ)
-            
-            # Generate identity images using the generators
-            x_QQ = G_F2Q(x_Q)
-            x_FF = G_Q2F(x_F)
+            # Generate fake images using the generators and compute losses.
+            # When AMP is enabled we wrap forward passes in `autocast` and scale the backward steps.
+            if scaler is not None:
+                with autocast():
+                    x_FQ = G_F2Q(x_F)
+                    x_QF = G_Q2F(x_Q)
 
-            # Calculate adversarial losses
-            G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
-            G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
-            
-            # Calculate cycle losses
-            G_cycle_loss_F = cycle_loss(x_FQF, x_F)
-            G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
-            
-            # Calculate identity losses
-            G_iden_loss_F = iden_loss(x_FF, x_F)
-            G_iden_loss_Q = iden_loss(x_QQ, x_Q)
-            
-            # Calculate total losses
-            G_adv_loss = G_adv_loss_F + G_adv_loss_Q
-            G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
-            G_iden_loss = G_iden_loss_F + G_iden_loss_Q
-            G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
+                    # Generate cyclic images using the generators
+                    x_QFQ = G_F2Q(x_QF)
+                    x_FQF = G_Q2F(x_FQ)
 
-            # Update the generators
-            G_optim.zero_grad()
-            G_total_loss.backward()
-            G_optim.step()
-            
+                    # Generate identity images using the generators
+                    x_QQ = G_F2Q(x_Q)
+                    x_FF = G_Q2F(x_F)
+
+                    # Calculate adversarial losses
+                    G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
+                    G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
+
+                    # Calculate cycle losses
+                    G_cycle_loss_F = cycle_loss(x_FQF, x_F)
+                    G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
+
+                    # Calculate identity losses
+                    G_iden_loss_F = iden_loss(x_FF, x_F)
+                    G_iden_loss_Q = iden_loss(x_QQ, x_Q)
+
+                    # Calculate total losses
+                    G_adv_loss = G_adv_loss_F + G_adv_loss_Q
+                    G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
+                    G_iden_loss = G_iden_loss_F + G_iden_loss_Q
+                    G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
+
+                G_optim.zero_grad()
+                scaler.scale(G_total_loss).backward()
+                scaler.step(G_optim)
+                scaler.update()
+            else:
+                x_FQ = G_F2Q(x_F)
+                x_QF = G_Q2F(x_Q)
+
+                # Generate cyclic images using the generators
+                x_QFQ = G_F2Q(x_QF)
+                x_FQF = G_Q2F(x_FQ)
+
+                # Generate identity images using the generators
+                x_QQ = G_F2Q(x_Q)
+                x_FF = G_Q2F(x_F)
+
+                # Calculate adversarial losses
+                G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
+                G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
+
+                # Calculate cycle losses
+                G_cycle_loss_F = cycle_loss(x_FQF, x_F)
+                G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
+
+                # Calculate identity losses
+                G_iden_loss_F = iden_loss(x_FF, x_F)
+                G_iden_loss_Q = iden_loss(x_QQ, x_Q)
+
+                # Calculate total losses
+                G_adv_loss = G_adv_loss_F + G_adv_loss_Q
+                G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
+                G_iden_loss = G_iden_loss_F + G_iden_loss_Q
+                G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
+
+                # Update the generators
+                G_optim.zero_grad()
+                G_total_loss.backward()
+                G_optim.step()
+
             # Set 'requires_grad' of the discriminators as 'True'
             set_requires_grad([D_F, D_Q], True)
 
             # Calculate adversarial losses for the discriminators
-            D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
-            D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
-            D_total_loss_F = D_adv_loss_F / 2.0
-            D_total_loss_Q = D_adv_loss_Q / 2.0
+            if scaler is not None:
+                with autocast():
+                    D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
+                    D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
+                    D_total_loss_F = D_adv_loss_F / 2.0
+                    D_total_loss_Q = D_adv_loss_Q / 2.0
 
-            # Update the discriminators
-            D_optim.zero_grad()
-            D_total_loss_F.backward()
-            D_total_loss_Q.backward()
-            D_optim.step()
+                D_optim.zero_grad()
+                scaler.scale(D_total_loss_F + D_total_loss_Q).backward()
+                scaler.step(D_optim)
+                scaler.update()
+            else:
+                D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
+                D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
+                D_total_loss_F = D_adv_loss_F / 2.0
+                D_total_loss_Q = D_adv_loss_Q / 2.0
+
+                # Update the discriminators
+                D_optim.zero_grad()
+                D_total_loss_F.backward()
+                D_total_loss_Q.backward()
+                D_optim.step()
 
             # Calculate the average loss during one epoch
             losses['G_adv_loss_F'](G_adv_loss_F.detach())
@@ -691,7 +784,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--use_checkpoint', action='store_true')
-    
+    parser.add_argument('--use_amp', action='store_true')
+
     args = parser.parse_args()
     
     # Set random seed
@@ -712,5 +806,7 @@ if __name__ == '__main__':
         ch_mult=args.ch_mult,
         num_res_blocks=args.num_res_blocks,
         lr=args.lr,
-        use_checkpoint=args.use_checkpoint
+        use_checkpoint=args.use_checkpoint,
+        use_amp=args.use_amp
     )
+
