@@ -1,4 +1,3 @@
-
 import random
 import argparse
 import itertools
@@ -22,24 +21,32 @@ from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 # Functions for caculating PSNR, SSIM
 # Peak Signal-to-Noise Ratio
 def psnr(A, ref):
+    ref = ref.copy()
+    A = A.copy()
     ref[ref < -1000] = -1000
     A[A < -1000] = -1000
     val_min = -1000
     val_max = np.amax(ref)
+    if val_max == val_min:
+        return 0.0
     ref = (ref - val_min) / (val_max - val_min)
     A = (A - val_min) / (val_max - val_min)
-    out = peak_signal_noise_ratio(ref, A)
+    out = peak_signal_noise_ratio(ref, A, data_range=1.0)
     return out
 
 # Structural similarity index
 def ssim(A, ref):
+    ref = ref.copy()
+    A = A.copy()
     ref[ref < -1000] = -1000
     A[A < -1000] = -1000
     val_min = -1000
     val_max = np.amax(ref)
+    if val_max == val_min:
+        return 0.0
     ref = (ref - val_min) / (val_max - val_min)
     A = (A - val_min) / (val_max - val_min)
-    out = structural_similarity(ref, A, data_range=2)
+    out = structural_similarity(ref, A, data_range=1.0)
     return out
 
 # Initialize parameters of neural networks
@@ -244,10 +251,21 @@ class ResnetBlock(nn.Module):
         self.out_channels = out_channels
 
         # Group normalization layer and convolutional layer
-        self.norm1 = torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
+        # make num_groups divide channels
+        use_groups = min(num_groups, in_channels)
+        if use_groups < 1:
+            use_groups = 1
+        while in_channels % use_groups != 0 and use_groups > 1:
+            use_groups -= 1
+        self.norm1 = torch.nn.GroupNorm(num_groups=use_groups, num_channels=in_channels, eps=1e-6, affine=True)
         self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
-        self.norm2 = torch.nn.GroupNorm(num_groups=num_groups, num_channels=out_channels, eps=1e-6, affine=True)
+        use_groups2 = min(num_groups, out_channels)
+        if use_groups2 < 1:
+            use_groups2 = 1
+        while out_channels % use_groups2 != 0 and use_groups2 > 1:
+            use_groups2 -= 1
+        self.norm2 = torch.nn.GroupNorm(num_groups=use_groups2, num_channels=out_channels, eps=1e-6, affine=True)
         self.conv2 = torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         
         # Shortcut connection
@@ -349,35 +367,20 @@ class Downsample(nn.Module):
 
         return x
 
-class ResidualDenseBlock(nn.Module):
-    """Residual Dense Block (RDB).
 
-    Implements a small dense block with local feature fusion and a residual connection.
-    Handles the case where `in_channels != out_channels` by projecting the residual with a 1x1 conv.
-    """
-    def __init__(self, in_channels, out_channels=None, num_layers=4, growth_channels=32):
-        super(ResidualDenseBlock, self).__init__()
-        out_channels = in_channels if out_channels is None else out_channels
+# --- Lightweight Residual Dense Block (Light RDB) ---
+class LightRDB(nn.Module):
+    """A small Residual Dense Block with 3 convs and dense connections, then a 1x1 to restore channels."""
+    def __init__(self, in_channels, growth=16, num_layers=3):
+        super().__init__()
         self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.num_layers = num_layers
-        self.growth_channels = growth_channels
-
+        g = int(growth)
         self.convs = nn.ModuleList()
-        conv_in_channels = in_channels
         for i in range(num_layers):
-            self.convs.append(nn.Conv2d(conv_in_channels, growth_channels, kernel_size=3, stride=1, padding=1))
-            conv_in_channels += growth_channels
-
-        # Local feature fusion
-        self.lff = nn.Conv2d(conv_in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-        self.act = nn.ReLU(inplace=True)
-
-        # If input and output channels differ, use a 1x1 projection for the residual connection
-        if in_channels != out_channels:
-            self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-        else:
-            self.proj = None
+            in_ch = in_channels + i * g
+            self.convs.append(nn.Conv2d(in_ch, g, kernel_size=3, padding=1))
+        self.conv1x1 = nn.Conv2d(in_channels + num_layers * g, in_channels, kernel_size=1)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
         features = [x]
@@ -385,74 +388,67 @@ class ResidualDenseBlock(nn.Module):
             inp = torch.cat(features, dim=1)
             out = self.act(conv(inp))
             features.append(out)
-        fused = self.lff(torch.cat(features, dim=1))
-        res = self.proj(x) if self.proj is not None else x
-        return fused + res
+        out = torch.cat(features, dim=1)
+        out = self.conv1x1(out)
+        return x + 0.2 * out
 
 
+# --- CBAM: Convolutional Block Attention Module ---
 class CBAM(nn.Module):
-    """Convolutional Block Attention Module (CBAM).
-
-    Applies channel attention followed by spatial attention.
-    Reference: "CBAM: Convolutional Block Attention Module", Woo et al., ECCV 2018.
-    """
     def __init__(self, channels, reduction=16, kernel_size=7):
-        super(CBAM, self).__init__()
-        self.channel_att = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, max(channels // reduction, 1), kernel_size=1, bias=True),
+        super().__init__()
+        # Channel attention
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv2d(max(channels // reduction, 1), channels, kernel_size=1, bias=True),
-            nn.Sigmoid()
+            nn.Linear(channels // reduction, channels, bias=False)
         )
-
-        self.spatial_att = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False),
-            nn.Sigmoid()
-        )
+        self.sigmoid = nn.Sigmoid()
+        # Spatial attention
+        self.spatial = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2, bias=False)
 
     def forward(self, x):
-        # Channel attention (use pooled spatial statistics)
-        avg = torch.mean(x, dim=(2, 3), keepdim=True)
-        ca = self.channel_att(avg)
-        x = x * ca
-
-        # Spatial attention: use channel-wise avg and max
-        avg_pool = torch.mean(x, dim=1, keepdim=True)
-        max_pool, _ = torch.max(x, dim=1, keepdim=True)
-        sa_in = torch.cat([avg_pool, max_pool], dim=1)
-        sa = self.spatial_att(sa_in)
-        x = x * sa
-
+        b, c, h, w = x.size()
+        # Channel attention
+        avg_pool = F.adaptive_avg_pool2d(x, 1).view(b, c)
+        max_pool = F.adaptive_max_pool2d(x, 1).view(b, c)
+        avg_out = self.mlp(avg_pool)
+        max_out = self.mlp(max_pool)
+        ch_att = self.sigmoid(avg_out + max_out).view(b, c, 1, 1)
+        x = x * ch_att
+        # Spatial attention
+        avg_map = torch.mean(x, dim=1, keepdim=True)
+        max_map, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_cat = torch.cat([avg_map, max_map], dim=1)
+        sp_att = self.sigmoid(self.spatial(spatial_cat))
+        x = x * sp_att
         return x
 
 
+# --- Dilated Mid Block ---
 class DilatedMidBlock(nn.Module):
-    """Mid block that uses multiple dilated convolutions to increase receptive field.
-
-    Stacks a few dilated conv layers (dilations: 1,2,4) with a residual connection.
-    """
-    def __init__(self, channels, dilation_rates=(1,2,4)):
-        super(DilatedMidBlock, self).__init__()
+    """Stack of conv layers with increasing dilation to enlarge receptive field without downsampling."""
+    def __init__(self, channels, num_layers=3, base_dilation=1):
+        super().__init__()
         layers = []
-        for d in dilation_rates:
-            layers.append(nn.Conv2d(channels, channels, kernel_size=3, padding=d, dilation=d))
-            layers.append(nn.GroupNorm(16, channels))
-            layers.append(nn.ReLU(inplace=True))
+        for i in range(num_layers):
+            dilation = base_dilation * (2 ** i)
+            padding = dilation
+            layers.append(nn.Conv2d(channels, channels, kernel_size=3, padding=padding, dilation=dilation))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
-        return x + self.net(x)
+        return x + 0.2 * self.net(x)
 
 
 class Generator(nn.Module):
-    """
-    Generator class for the CycleGAN model using RDB blocks, CBAM attention, and a dilated mid-block.
-    """
-    def __init__(self, in_channels, out_channels, ngf, ch_mult=(1, 2, 4, 8), num_res_blocks=3,
-                 rdb_layers=4, rdb_growth=32, use_cbam=True):
+    '''
+    Generator class for the CycleGAN model with LightRDB + CBAM + DilatedMidBlock in the bottleneck.
+    '''
+    
+    def __init__(self, in_channels, out_channels, ngf, ch_mult=(1, 2, 4, 8), num_res_blocks=3, use_cbam=True, rdb_growth=16):
         super(Generator, self).__init__()
-
         assert in_channels == out_channels, 'The number of input channels should be equal to the number of output channels.'
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -462,21 +458,23 @@ class Generator(nn.Module):
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
 
-        self.up_blocks = nn.ModuleList()
-        self.down_blocks = nn.ModuleList()
-
+        # The first layer of the generator
         self.conv_in = nn.Conv2d(in_channels, ngf, kernel_size=3, stride=1, padding=1)
+
+        # Initialize down and up blocks
+        self.down_blocks = nn.ModuleList()
+        self.up_blocks = nn.ModuleList()
 
         in_ch_mult = (1,) + tuple(ch_mult)
 
-        # Downsample path: replace ResnetBlock with ResidualDenseBlock
+        # Build downsampling path
         for level in range(self.num_resolutions):
             down_block = nn.ModuleList()
             block_in_channels = ngf * in_ch_mult[level]
             block_out_channels = ngf * ch_mult[level]
 
             for _ in range(self.num_res_blocks):
-                down_block.append(ResidualDenseBlock(block_in_channels, block_out_channels, num_layers=rdb_layers, growth_channels=rdb_growth))
+                down_block.append(ResnetBlock(block_in_channels, block_out_channels))
                 block_in_channels = block_out_channels
 
             if level != self.num_resolutions - 1:
@@ -484,10 +482,18 @@ class Generator(nn.Module):
 
             self.down_blocks.append(down_block)
 
-        # Dilated mid block
-        self.mid_block = DilatedMidBlock(ngf * ch_mult[-1])
+        # Bottleneck: Dilated mid-block + Light RDB + optional CBAM
+        bottleneck_channels = ngf * ch_mult[-1]
+        self.mid_block = nn.Sequential(
+            DilatedMidBlock(bottleneck_channels, num_layers=3, base_dilation=1),
+            LightRDB(bottleneck_channels, growth=rdb_growth, num_layers=3)
+        )
+        if self.use_cbam:
+            self.cbam = CBAM(bottleneck_channels, reduction=8)
+        else:
+            self.cbam = nn.Identity()
 
-        # Upsample path: use RDBs and Upsample modules
+        # Build upsampling path (mirror)
         for level in reversed(range(self.num_resolutions)):
             up_block = nn.ModuleList()
             block_in_channels = ngf * ch_mult[level]
@@ -498,7 +504,7 @@ class Generator(nn.Module):
                 if block_idx == self.num_res_blocks:
                     block_skip_channels = ngf * in_ch_mult[level]
                     block_out_channels = ngf * in_ch_mult[level]
-                up_block.append(ResidualDenseBlock(block_in_channels + block_skip_channels, block_out_channels, num_layers=rdb_layers, growth_channels=rdb_growth))
+                up_block.append(ResnetBlock(block_in_channels + block_skip_channels, block_out_channels))
                 block_in_channels = block_out_channels
 
             if level != 0:
@@ -506,38 +512,30 @@ class Generator(nn.Module):
 
             self.up_blocks.insert(0, up_block)
 
-        # Attention before the output
-        if self.use_cbam:
-            self.cbam = CBAM(ngf)
-        else:
-            self.cbam = None
-
         self.conv_out = torch.nn.Conv2d(ngf, out_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
+        # Encoder
         hs = [self.conv_in(x)]
-
         for level in range(self.num_resolutions):
             for block in self.down_blocks[level]:
                 h = block(hs[-1])
                 hs.append(h)
 
+        # Bottleneck
         h = self.mid_block(hs[-1])
+        h = self.cbam(h)
 
+        # Decoder
         for level in reversed(range(self.num_resolutions)):
             for block in self.up_blocks[level]:
                 if not isinstance(block, Upsample):
                     h = torch.cat([h, hs.pop()], dim=1)
                 h = block(h)
 
-        if self.cbam is not None:
-            h = self.cbam(h)
-
         h = self.conv_out(h)
         h = h + x
-
         return h
-
 
 # Discriminator (PatchGAN)
 class Discriminator(nn.Module):
@@ -788,7 +786,7 @@ def train(
     plt.savefig(join(path_result, 'loss_curve_2.png'))
     plt.close() 
     
-
+    
 if __name__ == '__main__':
     # Parse arguments
     parser = argparse.ArgumentParser()
