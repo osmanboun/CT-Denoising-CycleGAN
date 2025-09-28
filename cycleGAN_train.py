@@ -4,135 +4,44 @@ import argparse
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
-import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-from multiprocessing import cpu_count
 
 from os import listdir, makedirs
 from os.path import isdir, join 
 from torch.utils.data import Dataset, DataLoader
 from torch.nn import init
+from torch.cuda.amp import autocast, GradScaler
 
 from tqdm.auto import tqdm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-from torch.cuda.amp import autocast, GradScaler
 
 
-# Functions for calculating PSNR, SSIM
+# Functions for caculating PSNR, SSIM
 # Peak Signal-to-Noise Ratio
 def psnr(A, ref):
-    """
-    Compute PSNR between two 2D numpy arrays A and ref.
-    Both arrays are clipped at -1000 (HU floor). Images are normalized to [0,1]
-    using the min/max of the reference image and PSNR is computed with data_range=1.0.
-    Returns a float (higher is better). Handles constant images.
-    """
-    A = A.copy()
-    ref = ref.copy()
-    A[A < -1000] = -1000
     ref[ref < -1000] = -1000
-
-    ref_min = float(np.min(ref))
-    ref_max = float(np.max(ref))
-    denom = ref_max - ref_min
-    if denom <= 0:
-        return 100.0
-
-    ref_n = (ref - ref_min) / denom
-    A_n = (A - ref_min) / denom
-
-    return peak_signal_noise_ratio(ref_n, A_n, data_range=1.0)
+    A[A < -1000] = -1000
+    val_min = -1000
+    val_max = np.amax(ref)
+    ref = (ref - val_min) / (val_max - val_min)
+    A = (A - val_min) / (val_max - val_min)
+    out = peak_signal_noise_ratio(ref, A)
+    return out
 
 # Structural similarity index
 def ssim(A, ref):
-    """
-    Compute SSIM between two 2D numpy arrays A and ref.
-    Both arrays are clipped at -1000 and normalized to [0,1] using the
-    reference image range. Returns a float in [-1,1] (higher is better).
-    """
-    A = A.copy()
-    ref = ref.copy()
-    A[A < -1000] = -1000
     ref[ref < -1000] = -1000
-
-    ref_min = float(np.min(ref))
-    ref_max = float(np.max(ref))
-    denom = ref_max - ref_min
-    if denom <= 0:
-        return 1.0
-
-    ref_n = (ref - ref_min) / denom
-    A_n = (A - ref_min) / denom
-
-    # structural_similarity expects 2D arrays and a proper data_range
-    return structural_similarity(ref_n, A_n, data_range=1.0)
-
-
-# Torch-based SSIM (differentiable) and gradient loss for training
-import math
-
-def _gaussian(window_size, sigma):
-    gauss = torch.Tensor([math.exp(-(x - window_size//2)**2/(2*sigma**2)) for x in range(window_size)])
-    return gauss / gauss.sum()
-
-
-def create_window(window_size, channel):
-    _1D = _gaussian(window_size, 1.5).unsqueeze(1)
-    _2D = _1D.mm(_1D.t()).float().unsqueeze(0).unsqueeze(0)
-    window = _2D.expand(channel, 1, window_size, window_size).contiguous()
-    return window
-
-
-def ssim_torch(img1, img2, window_size=11, val_range=1.0):
-    """
-    Compute mean SSIM over batch using a Gaussian window. Returns a scalar in [-1,1].
-    Assumes img1 and img2 are torch tensors shaped (B, C, H, W) and scaled to [0, val_range].
-    """
-    (_, channel, _, _) = img1.size()
-    window = create_window(window_size, channel).to(img1.device).type(img1.dtype)
-
-    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
-    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
-
-    mu1_sq = mu1 * mu1
-    mu2_sq = mu2 * mu2
-    mu1_mu2 = mu1 * mu2
-
-    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=channel) - mu1_sq
-    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=channel) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=channel) - mu1_mu2
-
-    C1 = (0.01 * val_range) ** 2
-    C2 = (0.03 * val_range) ** 2
-
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-    return ssim_map.mean()
-
-
-def gradient_loss(pred, target):
-    """
-    L1 loss between image gradients (Sobel) of pred and target. Works on BxCxHxW tensors.
-    """
-    # Sobel kernels
-    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=pred.device, dtype=pred.dtype).view(1, 1, 3, 3)
-    sobel_y = sobel_x.permute(0, 1, 3, 2)
-
-    channels = pred.shape[1]
-    sobel_x = sobel_x.repeat(channels, 1, 1, 1)
-    sobel_y = sobel_y.repeat(channels, 1, 1, 1)
-
-    grad_pred_x = F.conv2d(pred, sobel_x, padding=1, groups=channels)
-    grad_pred_y = F.conv2d(pred, sobel_y, padding=1, groups=channels)
-    grad_target_x = F.conv2d(target, sobel_x, padding=1, groups=channels)
-    grad_target_y = F.conv2d(target, sobel_y, padding=1, groups=channels)
-
-    loss = (grad_pred_x - grad_target_x).abs().mean() + (grad_pred_y - grad_target_y).abs().mean()
-    return loss
-
+    A[A < -1000] = -1000
+    val_min = -1000
+    val_max = np.amax(ref)
+    ref = (ref - val_min) / (val_max - val_min)
+    A = (A - val_min) / (val_max - val_min)
+    out = structural_similarity(ref, A, data_range=2)
+    return out
 
 # Initialize parameters of neural networks
 def init_weights(net):
@@ -172,50 +81,6 @@ class Mean:
     
     def result(self):
         return self.mean
-
-
-# Image pool for storing previously generated images (used to update discriminator)
-class ImagePool:
-    """Initialize an image buffer that stores previously generated images.
-
-    This buffer enables the discriminator to be trained on a history of generated images
-    rather than only the most recent ones, which stabilizes GAN training (CycleGAN trick).
-    """
-    def __init__(self, pool_size=50):
-        self.pool_size = int(pool_size)
-        if self.pool_size > 0:
-            self.num_imgs = 0
-            self.images = []
-
-    def query(self, images):
-        """
-        Return images for discriminator training. Accepts a batch tensor (B,C,H,W).
-        For each image in the batch: if the pool isn't full, store and return image.
-        Otherwise, with probability 0.5 return a previously stored image (and replace it with the new one),
-        or return the new image directly.
-        """
-        if self.pool_size == 0:
-            return images
-
-        return_images = []
-        for img in images:
-            img = img.unsqueeze(0)
-            if self.num_imgs < self.pool_size:
-                # store and return
-                self.images.append(img.clone().detach())
-                self.num_imgs += 1
-                return_images.append(img)
-            else:
-                if random.random() > 0.5:
-                    # use previously stored image
-                    idx = random.randint(0, self.pool_size - 1)
-                    tmp = self.images[idx].clone().detach()
-                    # replace the stored image with the new one
-                    self.images[idx] = img.clone().detach()
-                    return_images.append(tmp)
-                else:
-                    return_images.append(img)
-        return torch.cat(return_images, dim=0)
 
 
 # CT dataset
@@ -271,75 +136,53 @@ class CT_Dataset(Dataset):
 # Transform for the random crop
 class RandomCrop(object):
     def __init__(self, patch_size):
-        self.patch_size = patch_size
+        self.patch_size = int(patch_size)
 
     def __call__(self, img):
         """
-        Robust random crop that handles inputs as numpy arrays or torch tensors,
-        supports channel-last (H, W, C) and channel-first (C, H, W) formats,
-        and pads images smaller than the patch size using reflection padding.
-        Returns a tensor with shape (C, patch_size, patch_size).
+        Robust random crop that handles small images.
+
+        - Accepts either a NumPy array (H, W) or a torch.Tensor (C, H, W) / (H, W).
+        - If the image is smaller than the requested patch size, it symmetrically pads
+          the image with zeros to reach at least the patch size before cropping.
+        - Returns a cropped tensor with shape (C, patch_size, patch_size).
         """
-        # If input is a numpy array, convert to torch tensor
-        if isinstance(img, np.ndarray):
-            img = torch.from_numpy(img).float()
-
-        # Ensure tensor type
+        # Convert numpy arrays to torch tensors if necessary
         if not torch.is_tensor(img):
-            img = torch.tensor(img, dtype=torch.float32)
+            img = torch.from_numpy(img).float()
+            # if HxW -> add channel dim
+            if img.dim() == 2:
+                img = img.unsqueeze(0)
+            # if HxWxC (rare), move channels to front
+            elif img.dim() == 3 and img.shape[2] in (1, 3) and img.shape[0] not in (1, 3):
+                img = img.permute(2, 0, 1).contiguous()
 
-        # Handle 2D images (H x W) -> add channel dim
+        # Ensure tensor is C x H x W
         if img.dim() == 2:
             img = img.unsqueeze(0)
+        c, h, w = img.shape
+        ph = self.patch_size
 
-        # Handle channel-last (H x W x C) -> convert to C x H x W
-        elif img.dim() == 3 and img.shape[-1] <= 4 and img.shape[0] > 4:
-            img = img.permute(2, 0, 1)
-
-        # Now img is expected to be C x H x W
-        C, H, W = img.shape
-
-        # Pad if image smaller than patch size (reflect padding)
-        pad_h = max(0, self.patch_size - H)
-        pad_w = max(0, self.patch_size - W)
+        # If image is smaller than patch, pad symmetrically (left/right, top/bottom)
+        pad_h = max(ph - h, 0)
+        pad_w = max(ph - w, 0)
         if pad_h > 0 or pad_w > 0:
-            # F.pad expects (pad_w_left, pad_w_right, pad_h_top, pad_h_bottom)
-            img = F.pad(img, (0, pad_w, 0, pad_h), mode='reflect')
-            C, H, W = img.shape
+            # F.pad expects pad as (left, right, top, bottom)
+            pad = (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2)
+            img = F.pad(img, pad, mode='constant', value=0.0)
+            _, h, w = img.shape
 
-        # Random crop coordinates (safe since we padded if necessary)
-        i = random.randint(0, H - self.patch_size)
-        j = random.randint(0, W - self.patch_size)
+        # Now sample a random top-left corner within valid range
+        i = random.randint(0, h - ph) if h - ph > 0 else 0
+        j = random.randint(0, w - ph) if w - ph > 0 else 0
 
-        return img[:, i:i + self.patch_size, j:j + self.patch_size]
-
+        return img[:, i:i + ph, j:j + ph]
 
 
 # Make dataloader for training/test
-def make_dataloader(path, train_batch_size=1, is_train=True, num_workers=None):
-    """
-    Create a DataLoader for training or testing.
-
-    Small I/O improvements:
-    - Automatically choose a sensible number of workers (defaults to cpu_count()-1 up to 4).
-    - Use pin_memory only when CUDA is available.
-    - Enable persistent_workers when num_workers>0 to avoid worker spawn overhead each epoch.
-    - Set a small prefetch_factor when using multiple workers.
-    """
-    # Path of 'train' and 'test' folders
+def make_dataloader(path, train_batch_size=1, is_train=True):
+    # Path of 'train' and 'test' folders    
     dataset_path = join(path, 'train') if is_train else join(path, 'test')
-
-    # Choose number of workers if not explicitly provided
-    if num_workers is None:
-        try:
-            n_workers = max(0, min(4, cpu_count() - 1))
-        except Exception:
-            n_workers = 2
-    else:
-        n_workers = max(0, int(num_workers))
-
-    pin_memory = torch.cuda.is_available()
-    persistent = True if n_workers > 0 else False
 
     # Transform for training data: convert to tensor, random horizontal/verical flip, random crop
     if is_train:
@@ -350,80 +193,95 @@ def make_dataloader(path, train_batch_size=1, is_train=True, num_workers=None):
             RandomCrop(128)
         ])
         train_dataset = CT_Dataset(dataset_path, train_transform)
-        dataloader = DataLoader(
-            train_dataset,
-            batch_size=train_batch_size,
-            shuffle=True,
-            num_workers=n_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent,
-            prefetch_factor=2 if n_workers > 0 else 2
-        )
+        dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, num_workers=0, pin_memory=True)
     else:
         test_transform = torchvision.transforms.Compose([
             torchvision.transforms.ToTensor()
         ])
 
         test_dataset = CT_Dataset(dataset_path, test_transform)
-        dataloader = DataLoader(
-            test_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=n_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent
-        )
+        dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
 
     return dataloader
 
   
 
-class ResnetBlock(nn.Module):
-    '''
-    Residual block
-    
-    This class represents a residual block in a ResNet architecture. It consists of two convolutional layers
-    with batch normalization and ReLU activation functions, and a shortcut connection to handle the case when
-    the input and output channels are different.
-    
-    Args:
-        in_channels (int): The number of input channels.
-        out_channels (int, optional): The number of output channels. If not specified, it is set to the same
-            as the input channels.
-        dropout (float, optional): The dropout rate. Default is 0.5.
-        num_groups (int, optional): The number of groups to separate the channels into for group normalization.
-            Default is 16.
-    '''
-    def __init__(self, in_channels, out_channels=None, num_groups=16):
-        super(ResnetBlock, self).__init__()
-        self.in_channels = in_channels
-        out_channels = in_channels if out_channels is None else out_channels
-        self.out_channels = out_channels
-
-        # Group normalization layer and convolutional layer
-        self.norm1 = torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
-        self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
-
-        self.norm2 = torch.nn.GroupNorm(num_groups=num_groups, num_channels=out_channels, eps=1e-6, affine=True)
-        self.conv2 = torch.nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        
-        # Shortcut connection
-        self.shortcut = torch.nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+class ResidualDenseBlock(nn.Module):
+    """
+    A small Residual Dense Block (RDB) used inside RRDB.
+    Uses 3 conv layers with dense connections and a local residual.
+    """
+    def __init__(self, in_channels, growth_channels=32):
+        super(ResidualDenseBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, growth_channels, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(in_channels + growth_channels, growth_channels, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(in_channels + 2 * growth_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
 
     def forward(self, x):
-        h = x
-        h = self.norm1(h)
-        h = F.relu(h, inplace=True)
-        h = self.conv1(h)
-        
-        h = self.norm2(h)
-        h = F.relu(h, inplace=True)
+        c1 = self.lrelu(self.conv1(x))
+        c2 = self.lrelu(self.conv2(torch.cat([x, c1], dim=1)))
+        c3 = self.conv3(torch.cat([x, c1, c2], dim=1))
+        # local residual scaling
+        return x + 0.2 * c3
+
+
+class RRDB(nn.Module):
+    """
+    Residual-in-Residual Dense Block (RRDB).
+    Stacks several ResidualDenseBlock modules with an outer residual connection.
+
+    This RRDB accepts an optional `out_channels` argument. If `out_channels` differs from
+    `in_channels` a 1x1 convolution is applied at the end to match the desired number of channels.
+    """
+    def __init__(self, in_channels, growth_channels=32, num_rdb=3, out_channels=None):
+        super(RRDB, self).__init__()
+        self.in_channels = in_channels
+        self.growth_channels = growth_channels
+        self.rdbs = nn.Sequential(*[ResidualDenseBlock(in_channels, growth_channels) for _ in range(num_rdb)])
+        self.scale = 0.2
+        # If out_channels is provided and different from in_channels, use a 1x1 conv to map channels
+        if out_channels is None or out_channels == in_channels:
+            self.match_conv = None
+        else:
+            self.match_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        out = x + self.scale * self.rdbs(x)
+        if self.match_conv is not None:
+            out = self.match_conv(out)
+        return out
+
+
+# Lightweight residual block for encoder/decoder (cheap replacement for RRDB)
+class SimpleResBlock(nn.Module):
+    """A lightweight residual block used in encoder/decoder to save compute.
+
+    It supports changing the number of channels via a 1x1 projection when
+    in_channels != out_channels and uses a small residual scale to stabilise training.
+    """
+    def __init__(self, in_channels, out_channels=None):
+        super(SimpleResBlock, self).__init__()
+        if out_channels is None:
+            out_channels = in_channels
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        if in_channels != out_channels:
+            self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+        else:
+            self.proj = None
+
+    def forward(self, x):
+        h = self.act(self.conv1(x))
         h = self.conv2(h)
-
-        if self.in_channels != self.out_channels:
-            x = self.shortcut(x)
-
-        return x + h
+        if self.proj is not None:
+            res = self.proj(x)
+        else:
+            res = x
+        return res + 0.1 * h
 
 
 class Upsample(nn.Module):
@@ -550,7 +408,7 @@ class Generator(nn.Module):
 
             for _ in range(self.num_res_blocks):
                 # Add a residual block to the downsample block
-                down_block.append(ResnetBlock(block_in_channels, block_out_channels))
+                down_block.append(SimpleResBlock(block_in_channels, block_out_channels))
                 block_in_channels = block_out_channels
         
             if level != self.num_resolutions - 1:
@@ -560,7 +418,7 @@ class Generator(nn.Module):
             self.down_blocks.append(down_block)
 
         # The middle block of the generator
-        self.mid_block = ResnetBlock(ngf * ch_mult[-1], ngf * ch_mult[-1])
+        self.mid_block = RRDB(ngf * ch_mult[-1], growth_channels=16, num_rdb=1, out_channels=ngf * ch_mult[-1])
 
         for level in reversed(range(self.num_resolutions)):
             up_block = nn.ModuleList()
@@ -575,7 +433,7 @@ class Generator(nn.Module):
                     block_skip_channels = ngf * in_ch_mult[level]
                     block_out_channels = ngf * in_ch_mult[level]
                 # Add a residual block to the upsample block
-                up_block.append(ResnetBlock(block_in_channels + block_skip_channels, block_out_channels))
+                up_block.append(SimpleResBlock(block_in_channels + block_skip_channels, block_out_channels))
                 block_in_channels = block_out_channels
 
             if level != 0:
@@ -629,6 +487,15 @@ class Discriminator(nn.Module):
         in_channels (int): Number of input channels.
         ndf (int): Number of discriminator filters.
 
+    Attributes:
+        in_channels (int): Number of input channels.
+        ndf (int): Number of discriminator filters.
+        conv1 (nn.Conv2d): Convolutional layer 1.
+        conv2 (nn.Conv2d): Convolutional layer 2.
+        conv3 (nn.Conv2d): Convolutional layer 3.
+        conv4 (nn.Conv2d): Convolutional layer 4.
+        conv5 (nn.Conv2d): Convolutional layer 5.
+
     '''
 
     def __init__(self, in_channels, ndf=32):
@@ -636,18 +503,19 @@ class Discriminator(nn.Module):
         self.in_channels = in_channels
         self.ndf = ndf
 
-        # Convolutional layers (same configuration as original)
+        # Convolutional layers
         self.conv1 = nn.Conv2d(in_channels, ndf, kernel_size=4, stride=2)
         self.conv2 = nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2)
         self.conv4 = nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=1)
         self.conv5 = nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1)
 
-        # Declare InstanceNorm layers once in __init__ to avoid recreating them each forward
+        # Register InstanceNorm layers properly (created once in __init__)
+        # Using affine=False (default) for standard InstanceNorm behavior in PatchGAN.
         self.norm2 = nn.InstanceNorm2d(ndf * 2, affine=False)
         self.norm3 = nn.InstanceNorm2d(ndf * 4, affine=False)
         self.norm4 = nn.InstanceNorm2d(ndf * 8, affine=False)
-
+    
     def forward(self, x, threshold=0.2):
         '''
         Forward pass of the discriminator network.
@@ -661,19 +529,19 @@ class Discriminator(nn.Module):
 
         '''
         h = self.conv1(x)
-        h = nn.functional.leaky_relu(h, threshold)
+        h = F.leaky_relu(h, threshold)
 
         h = self.conv2(h)
         h = self.norm2(h)
-        h = nn.functional.leaky_relu(h, threshold)
+        h = F.leaky_relu(h, threshold)
 
         h = self.conv3(h)
         h = self.norm3(h)
-        h = nn.functional.leaky_relu(h, threshold)
+        h = F.leaky_relu(h, threshold)
 
         h = self.conv4(h)
         h = self.norm4(h)
-        h = nn.functional.leaky_relu(h, threshold)
+        h = F.leaky_relu(h, threshold)
 
         h = self.conv5(h)
         return h
@@ -695,8 +563,15 @@ def train(
     ch_mult=[1, 2, 4, 8],
     num_res_blocks=3,
     lr=2e-4,
-    use_checkpoint=False
+    trained_epoch = 0,
+    use_checkpoint=False,
+    use_amp=False
 ):
+
+    # Initialize AMP scaler if requested and CUDA is available
+    scaler = GradScaler() if (use_amp and torch.cuda.is_available()) else None
+
+    # Initialize a dictionary to store the losses:
     # Hyperparameters
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -720,10 +595,6 @@ def train(
     D_F = Discriminator(1, d_channels).to(device)
     D_Q = Discriminator(1, d_channels).to(device)
 
-    # Image pools for discriminator history (CycleGAN paper suggests a small buffer, e.g. 50)
-    pool_F = ImagePool(pool_size=50)  # stores fake full images (x_QF)
-    pool_Q = ImagePool(pool_size=50)  # stores fake quarter images (x_FQ)
-
     # Make optimizers
     G_optim = torch.optim.Adam(itertools.chain(G_F2Q.parameters(), G_Q2F.parameters()), lr, betas=(beta1, beta2))
     D_optim = torch.optim.Adam(itertools.chain(D_F.parameters(), D_Q.parameters()), lr, betas=(beta1, beta2))
@@ -743,15 +614,6 @@ def train(
                 'D_adv_loss_F',
                 'D_adv_loss_Q']
 
-    # SSIM and gradient loss weights (additive to generator loss)
-    lambda_ssim = 1.0
-    lambda_grad = 1.0
-
-
-    # Mixed precision scalers
-    scaler_G = GradScaler()
-    scaler_D = GradScaler()
-
     if use_checkpoint:
         # If a checkpoint exists, load the state of the model and optimizer from the checkpoint
         checkpoint = torch.load(join(path_checkpoint, model_name + '.pth'))
@@ -770,12 +632,7 @@ def train(
         
     # Set the initial trained epoch as 0
     trained_epoch = 0
-
-    # Validation tracking
-    best_val_psnr = -1e9
-    val_psnr_list = []
-    val_ssim_list = []
-
+    
     # Initialize a dictionary to store the losses
     losses_list = {name: list() for name in loss_name}
     print('Start from random initialized model')
@@ -792,131 +649,119 @@ def train(
 
             # Set 'requires_grad' of the discriminators as 'False' to avoid computing gradients of the discriminators
             set_requires_grad([D_F, D_Q], False)
-            # Update generators: perform forward and loss computations under autocast
-            with autocast(enabled=torch.cuda.is_available()):
-                # Generate fake images using the generators
+
+            # --- Generator update ---
+            # Zero gradients before the forward (good practice for AMP)
+            G_optim.zero_grad()
+
+            if scaler is not None:
+                # Mixed precision forward + loss computation
+                with autocast():
+                    x_FQ = G_F2Q(x_F)
+                    x_QF = G_Q2F(x_Q)
+
+                    # Cyclic / identity
+                    x_QFQ = G_F2Q(x_QF)
+                    x_FQF = G_Q2F(x_FQ)
+                    x_QQ = G_F2Q(x_Q)
+                    x_FF = G_Q2F(x_F)
+
+                    # Compute discriminator predictions once and reuse
+                    D_pred_Q_from_F = D_Q(x_FQ)
+                    D_pred_F_from_Q = D_F(x_QF)
+
+                    # Generator adversarial losses (LSGAN)
+                    G_adv_loss_F = adv_loss(D_pred_F_from_Q, torch.ones_like(D_pred_F_from_Q))
+                    G_adv_loss_Q = adv_loss(D_pred_Q_from_F, torch.ones_like(D_pred_Q_from_F))
+
+                    # Cycle & identity losses
+                    G_cycle_loss_F = cycle_loss(x_FQF, x_F)
+                    G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
+                    G_iden_loss_F = iden_loss(x_FF, x_F)
+                    G_iden_loss_Q = iden_loss(x_QQ, x_Q)
+
+                    G_total_loss = (G_adv_loss_F + G_adv_loss_Q) + lambda_cycle * (G_cycle_loss_F + G_cycle_loss_Q) + lambda_iden * (G_iden_loss_F + G_iden_loss_Q)
+
+                # Backprop with scaler
+                scaler.scale(G_total_loss).backward()
+                scaler.step(G_optim)
+                scaler.update()
+            else:
+                # Standard precision path
                 x_FQ = G_F2Q(x_F)
                 x_QF = G_Q2F(x_Q)
 
-                # Generate cyclic images using the generators
                 x_QFQ = G_F2Q(x_QF)
                 x_FQF = G_Q2F(x_FQ)
-
-                # Generate identity images using the generators
                 x_QQ = G_F2Q(x_Q)
                 x_FF = G_Q2F(x_F)
 
-                # Calculate adversarial losses (discriminator calls are inside autocast)
-                G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
-                G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
+                D_pred_Q_from_F = D_Q(x_FQ)
+                D_pred_F_from_Q = D_F(x_QF)
 
-                # Calculate cycle losses
+                G_adv_loss_F = adv_loss(D_pred_F_from_Q, torch.ones_like(D_pred_F_from_Q))
+                G_adv_loss_Q = adv_loss(D_pred_Q_from_F, torch.ones_like(D_pred_Q_from_F))
+
                 G_cycle_loss_F = cycle_loss(x_FQF, x_F)
                 G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
-
-                # Calculate identity losses
                 G_iden_loss_F = iden_loss(x_FF, x_F)
                 G_iden_loss_Q = iden_loss(x_QQ, x_Q)
 
-                # SSIM losses (1 - ssim so lower is better)
-                # ssim_torch expects images scaled to [0,1] (we assume inputs are already normalized)
-                G_ssim_F = 1.0 - ssim_torch(x_QF, x_F)
-                G_ssim_Q = 1.0 - ssim_torch(x_FQ, x_Q)
+                G_total_loss = (G_adv_loss_F + G_adv_loss_Q) + lambda_cycle * (G_cycle_loss_F + G_cycle_loss_Q) + lambda_iden * (G_iden_loss_F + G_iden_loss_Q)
 
-                # Gradient losses (edge-aware)
-                G_grad_F = gradient_loss(x_QF, x_F)
-                G_grad_Q = gradient_loss(x_FQ, x_Q)
-
-                # Calculate total losses
-                G_adv_loss = G_adv_loss_F + G_adv_loss_Q
-                G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
-                G_iden_loss = G_iden_loss_F + G_iden_loss_Q
-                G_ssim_loss = G_ssim_F + G_ssim_Q
-                G_grad_loss = G_grad_F + G_grad_Q
-
-                G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss) + lambda_ssim * (G_ssim_loss) + lambda_grad * (G_grad_loss)
-
-            # Update the generators (with GradScaler if available)
-            G_optim.zero_grad()
-            if scaler_G is not None:
-                scaler_G.scale(G_total_loss).backward()
-                scaler_G.step(G_optim)
-                scaler_G.update()
-            else:
                 G_total_loss.backward()
                 G_optim.step()
-            
-            # Set 'requires_grad' of the discriminators as 'True'
+
+            # --- Discriminator update ---
+            # Enable gradients for discriminators
             set_requires_grad([D_F, D_Q], True)
-            # Calculate adversarial losses for the discriminators
-            # Use image pools (history) for generated images to stabilize discriminator training
-            fake_QF_for_D = pool_F.query(x_QF.detach())
-            fake_FQ_for_D = pool_Q.query(x_FQ.detach())
 
-            with autocast(enabled=torch.cuda.is_available()):
-                real_F_out = D_F(x_F)
-                fake_F_out = D_F(fake_QF_for_D)
-                D_adv_loss_F = adv_loss(real_F_out, torch.ones_like(real_F_out)) + adv_loss(fake_F_out, torch.zeros_like(fake_F_out))
-
-                real_Q_out = D_Q(x_Q)
-                fake_Q_out = D_Q(fake_FQ_for_D)
-                D_adv_loss_Q = adv_loss(real_Q_out, torch.ones_like(real_Q_out)) + adv_loss(fake_Q_out, torch.zeros_like(fake_Q_out))
-
-            D_total_loss_F = D_adv_loss_F / 2.0
-            D_total_loss_Q = D_adv_loss_Q / 2.0
-
-            # Update the discriminators (with GradScaler if available)
             D_optim.zero_grad()
-            D_total_loss = D_total_loss_F + D_total_loss_Q
-            if scaler_D is not None:
-                scaler_D.scale(D_total_loss).backward()
-                scaler_D.step(D_optim)
-                scaler_D.update()
+            if scaler is not None:
+                with autocast():
+                    D_real_F = D_F(x_F)
+                    D_fake_F = D_F(x_QF.detach())
+                    D_adv_loss_F = adv_loss(D_real_F, torch.ones_like(D_real_F)) + adv_loss(D_fake_F, torch.zeros_like(D_fake_F))
+
+                    D_real_Q = D_Q(x_Q)
+                    D_fake_Q = D_Q(x_FQ.detach())
+                    D_adv_loss_Q = adv_loss(D_real_Q, torch.ones_like(D_real_Q)) + adv_loss(D_fake_Q, torch.zeros_like(D_fake_Q))
+
+                    D_total_loss = 0.5 * (D_adv_loss_F + D_adv_loss_Q)
+
+                # Backprop & step with scaler
+                scaler.scale(D_total_loss).backward()
+                scaler.step(D_optim)
+                scaler.update()
             else:
-                D_total_loss.backward()
+                D_real_F = D_F(x_F)
+                D_fake_F = D_F(x_QF.detach())
+                D_adv_loss_F = adv_loss(D_real_F, torch.ones_like(D_real_F)) + adv_loss(D_fake_F, torch.zeros_like(D_fake_F))
+
+                D_real_Q = D_Q(x_Q)
+                D_fake_Q = D_Q(x_FQ.detach())
+                D_adv_loss_Q = adv_loss(D_real_Q, torch.ones_like(D_real_Q)) + adv_loss(D_fake_Q, torch.zeros_like(D_fake_Q))
+
+                D_total_loss_F = D_adv_loss_F / 2.0
+                D_total_loss_Q = D_adv_loss_Q / 2.0
+
+                D_total_loss_F.backward()
+                D_total_loss_Q.backward()
                 D_optim.step()
 
-            # Calculate the average loss during one epoch
-            losses['G_adv_loss_F'](G_adv_loss_F.detach())
-            losses['G_adv_loss_Q'](G_adv_loss_Q.detach())
-            losses['G_cycle_loss_F'](G_cycle_loss_F.detach())
-            losses['G_cycle_loss_Q'](G_cycle_loss_Q.detach())
-            losses['G_iden_loss_F'](G_iden_loss_F.detach())
-            losses['G_iden_loss_Q'](G_iden_loss_Q.detach())
-            losses['D_adv_loss_F'](D_adv_loss_F.detach())
-            losses['D_adv_loss_Q'](D_adv_loss_Q.detach())
-    
+            # Calculate the average loss during one epoch (store scalar floats)
+            losses['G_adv_loss_F'](G_adv_loss_F.detach().cpu().item())
+            losses['G_adv_loss_Q'](G_adv_loss_Q.detach().cpu().item())
+            losses['G_cycle_loss_F'](G_cycle_loss_F.detach().cpu().item())
+            losses['G_cycle_loss_Q'](G_cycle_loss_Q.detach().cpu().item())
+            losses['G_iden_loss_F'](G_iden_loss_F.detach().cpu().item())
+            losses['G_iden_loss_Q'](G_iden_loss_Q.detach().cpu().item())
+            losses['D_adv_loss_F'](D_adv_loss_F.detach().cpu().item())
+            losses['D_adv_loss_Q'](D_adv_loss_Q.detach().cpu().item())
+
         for name in loss_name:
             losses_list[name].append(losses[name].result())
-
-        # Validation evaluation (compute PSNR/SSIM on test set)
-        val_loader = make_dataloader(path_data, train_batch_size=1, is_train=False)
-        G_F2Q.eval(); G_Q2F.eval()
-        psnr_vals = []
-        ssim_vals = []
-        with torch.no_grad():
-            for v_F, v_Q, _ in val_loader:
-                v_F = v_F.to(device); v_Q = v_Q.to(device)
-                pred = G_Q2F(v_Q)
-                pred_np = pred.squeeze().cpu().numpy()
-                ref_np = v_F.squeeze().cpu().numpy()
-                psnr_vals.append(psnr(pred_np.copy(), ref_np.copy()))
-                ssim_vals.append(ssim(pred_np.copy(), ref_np.copy()))
-        avg_psnr = float(np.mean(psnr_vals)) if len(psnr_vals) > 0 else 0.0
-        avg_ssim = float(np.mean(ssim_vals)) if len(ssim_vals) > 0 else 0.0
-        val_psnr_list.append(avg_psnr)
-        val_ssim_list.append(avg_ssim)
-
-        # Save best model by validation PSNR
-        if avg_psnr > best_val_psnr:
-            best_val_psnr = avg_psnr
-            torch.save({'epoch': epoch + 1, 'G_F2Q_state_dict': G_F2Q.state_dict(), 'G_Q2F_state_dict': G_Q2F.state_dict(),
-                        'D_F_state_dict': D_F.state_dict(), 'D_Q_state_dict': D_Q.state_dict(),
-                        'G_optim_state_dict': G_optim.state_dict(), 'D_optim_state_dict': D_optim.state_dict()},
-                       join(path_checkpoint, model_name + '_best.pth'))
-        G_F2Q.train(); G_Q2F.train()
-        G_F2Q.train(); G_Q2F.train()
-
+        
         # Save the trained model and list of losses
         torch.save({'epoch': epoch + 1, 'G_F2Q_state_dict': G_F2Q.state_dict(), 'G_Q2F_state_dict': G_Q2F.state_dict(),
                         'D_F_state_dict': D_F.state_dict(), 'D_Q_state_dict': D_Q.state_dict(),
@@ -924,15 +769,7 @@ def train(
         for name in loss_name:
             torch.save(losses_list[name], join(path_result, name + '.npy'))
             
-        # Save validation metrics if they exist
-        try:
-            np.save(join(path_result, 'val_psnr.npy'), np.array(val_psnr_list))
-            np.save(join(path_result, 'val_ssim.npy'), np.array(val_ssim_list))
-        except NameError:
-            # validation lists not defined yet; skip
-            pass
-
-        # Plot loss graph (adversarial loss)
+    # Plot loss graph (adversarial loss)
     plt.figure(1)
     for name in ['G_adv_loss_F', 'G_adv_loss_Q', 'D_adv_loss_F', 'D_adv_loss_Q']:
         loss_arr = torch.load(join(path_result, name + '.npy'), map_location='cpu')
@@ -971,7 +808,7 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_iden', type=int, default=5)
     parser.add_argument('--beta1', type=float, default=0.5)
     parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--num_epoch', type=int, default=12)
+    parser.add_argument('--num_epoch', type=int, default=80)
     parser.add_argument('--g_channels', type=int, default=32)
     parser.add_argument('--d_channels', type=int, default=64)
     parser.add_argument('--ch_mult', type=int, nargs='+', default=[1, 2, 4, 8])
@@ -979,7 +816,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--use_checkpoint', action='store_true')
-    
+    parser.add_argument('--use_amp', action='store_true')
+
     args = parser.parse_args()
     
     # Set random seed
@@ -1000,5 +838,6 @@ if __name__ == '__main__':
         ch_mult=args.ch_mult,
         num_res_blocks=args.num_res_blocks,
         lr=args.lr,
-        use_checkpoint=args.use_checkpoint
+        use_checkpoint=args.use_checkpoint,
+        use_amp=args.use_amp
     )
