@@ -14,7 +14,7 @@ from os.path import isdir, join
 from torch.utils.data import Dataset, DataLoader
 from torch.nn import init
 
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 
