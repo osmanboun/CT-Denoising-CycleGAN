@@ -14,8 +14,7 @@ from os.path import isdir, join
 from torch.utils.data import Dataset, DataLoader
 from torch.nn import init
 
-# Use the notebook-specific tqdm for Colab/Jupyter to get clean in-place bars
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 
@@ -615,7 +614,6 @@ def train(
 
     # Make dataloaders
     train_dataloader = make_dataloader(path_data, batch_size)
-    train_len = len(train_dataloader)
 
     # Make generators (G_F2Q: full to quarter / G_Q2F: quarter to full)
     G_F2Q = Generator(1, 1, g_channels, ch_mult=ch_mult, num_res_blocks=num_res_blocks).to(device)
@@ -673,92 +671,84 @@ def train(
     print('Start from random initialized model')
 
     # Start the training loop
-    # Outer epoch loop: use position=0 so the epoch bar stays on top
-    for epoch in tqdm(range(trained_epoch, num_epoch), desc='Epoch', total=num_epoch, initial=trained_epoch, position=0, leave=True, dynamic_ncols=True):
+    for epoch in tqdm(range(trained_epoch, num_epoch), desc='Epoch', total=num_epoch, initial=trained_epoch):
         # Initialize a dictionary to store the mean losses for this epoch
         losses = {name: Mean() for name in loss_name}
 
-        # Inner step loop: position=1, leave=False to avoid spam; iterate with the dataloader wrapped by tqdm
-        with tqdm(train_dataloader, desc='Step', total=train_len, leave=False, position=1, dynamic_ncols=True) as step_bar:
-            for step, (x_F, x_Q, _) in enumerate(step_bar, start=1):
-                # Move the data to the device (GPU or CPU)
-                x_F = x_F.to(device)
-                x_Q = x_Q.to(device)
+        for x_F, x_Q, _ in tqdm(train_dataloader, desc='Step'):
+            # Move the data to the device (GPU or CPU)
+            x_F = x_F.to(device)
+            x_Q = x_Q.to(device)
 
-                # ------------------------
-                #  Train Generators (with AMP)
-                # ------------------------
-                set_requires_grad([D_F, D_Q], False)
+            # ------------------------
+            #  Train Generators (with AMP)
+            # ------------------------
+            set_requires_grad([D_F, D_Q], False)
 
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    # Generate fake images using the generators
-                    x_FQ = G_F2Q(x_F)
-                    x_QF = G_Q2F(x_Q)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                # Generate fake images using the generators
+                x_FQ = G_F2Q(x_F)
+                x_QF = G_Q2F(x_Q)
 
-                    # Generate cyclic images using the generators
-                    x_QFQ = G_F2Q(x_QF)
-                    x_FQF = G_Q2F(x_FQ)
+                # Generate cyclic images using the generators
+                x_QFQ = G_F2Q(x_QF)
+                x_FQF = G_Q2F(x_FQ)
 
-                    # Generate identity images using the generators
-                    x_QQ = G_F2Q(x_Q)
-                    x_FF = G_Q2F(x_F)
+                # Generate identity images using the generators
+                x_QQ = G_F2Q(x_Q)
+                x_FF = G_Q2F(x_F)
 
-                    # Calculate adversarial losses (generators try to fool discriminators)
-                    G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
-                    G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
+                # Calculate adversarial losses (generators try to fool discriminators)
+                G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
+                G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
 
-                    # Calculate cycle losses
-                    G_cycle_loss_F = cycle_loss(x_FQF, x_F)
-                    G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
+                # Calculate cycle losses
+                G_cycle_loss_F = cycle_loss(x_FQF, x_F)
+                G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
 
-                    # Calculate identity losses
-                    G_iden_loss_F = iden_loss(x_FF, x_F)
-                    G_iden_loss_Q = iden_loss(x_QQ, x_Q)
+                # Calculate identity losses
+                G_iden_loss_F = iden_loss(x_FF, x_F)
+                G_iden_loss_Q = iden_loss(x_QQ, x_Q)
 
-                    # Total generator losses
-                    G_total_loss = G_adv_loss_F + G_adv_loss_Q + lambda_cycle * (G_cycle_loss_F + G_cycle_loss_Q) + lambda_iden * (G_iden_loss_F + G_iden_loss_Q)
+                # Total generator losses
+                G_adv_loss = G_adv_loss_F + G_adv_loss_Q
+                G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
+                G_iden_loss = G_iden_loss_F + G_iden_loss_Q
+                G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
 
-                # Update the generators with scaled gradients
-                G_optim.zero_grad()
-                scaler_G.scale(G_total_loss).backward()
-                scaler_G.step(G_optim)
-                scaler_G.update()
+            # Update the generators with scaled gradients
+            G_optim.zero_grad()
+            scaler_G.scale(G_total_loss).backward()
+            scaler_G.step(G_optim)
+            scaler_G.update()
 
-                # ------------------------
-                #  Train Discriminators (with AMP)
-                # ------------------------
-                set_requires_grad([D_F, D_Q], True)
+            # ------------------------
+            #  Train Discriminators (with AMP)
+            # ------------------------
+            set_requires_grad([D_F, D_Q], True)
 
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
-                    D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
-                    D_total_loss_F = D_adv_loss_F / 2.0
-                    D_total_loss_Q = D_adv_loss_Q / 2.0
-                    D_total_loss = D_total_loss_F + D_total_loss_Q
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
+                D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
+                D_total_loss_F = D_adv_loss_F / 2.0
+                D_total_loss_Q = D_adv_loss_Q / 2.0
+                D_total_loss = D_total_loss_F + D_total_loss_Q
 
-                D_optim.zero_grad()
-                scaler_D.scale(D_total_loss).backward()
-                scaler_D.step(D_optim)
-                scaler_D.update()
+            D_optim.zero_grad()
+            scaler_D.scale(D_total_loss).backward()
+            scaler_D.step(D_optim)
+            scaler_D.update()
 
-                # Calculate the average loss during one epoch
-                losses['G_adv_loss_F'](G_adv_loss_F.detach())
-                losses['G_adv_loss_Q'](G_adv_loss_Q.detach())
-                losses['G_cycle_loss_F'](G_cycle_loss_F.detach())
-                losses['G_cycle_loss_Q'](G_cycle_loss_Q.detach())
-                losses['G_iden_loss_F'](G_iden_loss_F.detach())
-                losses['G_iden_loss_Q'](G_iden_loss_Q.detach())
-                losses['D_adv_loss_F'](D_adv_loss_F.detach())
-                losses['D_adv_loss_Q'](D_adv_loss_Q.detach())
+            # Calculate the average loss during one epoch
+            losses['G_adv_loss_F'](G_adv_loss_F.detach())
+            losses['G_adv_loss_Q'](G_adv_loss_Q.detach())
+            losses['G_cycle_loss_F'](G_cycle_loss_F.detach())
+            losses['G_cycle_loss_Q'](G_cycle_loss_Q.detach())
+            losses['G_iden_loss_F'](G_iden_loss_F.detach())
+            losses['G_iden_loss_Q'](G_iden_loss_Q.detach())
+            losses['D_adv_loss_F'](D_adv_loss_F.detach())
+            losses['D_adv_loss_Q'](D_adv_loss_Q.detach())
 
-                # Occasionally update the step bar postfix with summary stats (adjust frequency by changing modulus)
-                if (step % max(1, train_len // 10)) == 0 or step == 1:
-                    step_bar.set_postfix({'step': f"{step}/{train_len}",
-                                          'G_adv_F': float(losses['G_adv_loss_F'].result()),
-                                          'G_cyc_F': float(losses['G_cycle_loss_F'].result())},
-                                         refresh=False)
-
-        # End of epoch: append epoch means to losses_list
         for name in loss_name:
             losses_list[name].append(losses[name].result())
         
@@ -808,7 +798,7 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_iden', type=int, default=5)
     parser.add_argument('--beta1', type=float, default=0.5)
     parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--num_epoch', type=int, default=36)
+    parser.add_argument('--num_epoch', type=int, default=28)
     parser.add_argument('--g_channels', type=int, default=32)
     parser.add_argument('--d_channels', type=int, default=64)
     parser.add_argument('--ch_mult', type=int, nargs='+', default=[1, 2, 4, 8])
