@@ -14,7 +14,7 @@ from os.path import isdir, join
 from torch.utils.data import Dataset, DataLoader
 from torch.nn import init
 
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 
@@ -675,7 +675,7 @@ def train(
         # Initialize a dictionary to store the mean losses for this epoch
         losses = {name: Mean() for name in loss_name}
 
-        for x_F, x_Q, _ in tqdm(train_dataloader, desc='Step', leave=False):
+        for x_F, x_Q, _ in tqdm(train_dataloader, desc='Step'):
             # Move the data to the device (GPU or CPU)
             x_F = x_F.to(device)
             x_Q = x_Q.to(device)
@@ -798,7 +798,7 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_iden', type=int, default=5)
     parser.add_argument('--beta1', type=float, default=0.5)
     parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--num_epoch', type=int, default=40)
+    parser.add_argument('--num_epoch', type=int, default=36)
     parser.add_argument('--g_channels', type=int, default=32)
     parser.add_argument('--d_channels', type=int, default=64)
     parser.add_argument('--ch_mult', type=int, nargs='+', default=[1, 2, 4, 8])
