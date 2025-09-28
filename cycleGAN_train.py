@@ -136,47 +136,15 @@ class CT_Dataset(Dataset):
 # Transform for the random crop
 class RandomCrop(object):
     def __init__(self, patch_size):
-        self.patch_size = int(patch_size)
-
+        self.patch_size = patch_size
+    
     def __call__(self, img):
-        """
-        Robust random crop that handles small images.
+        # Randomly crop the image into a patch with the size [self.patch_size, self.patch_size]
+        w, h = img.size(-1), img.size(-2)
+        i = random.randint(0, h - self.patch_size)
+        j = random.randint(0, w - self.patch_size)
 
-        - Accepts either a NumPy array (H, W) or a torch.Tensor (C, H, W) / (H, W).
-        - If the image is smaller than the requested patch size, it symmetrically pads
-          the image with zeros to reach at least the patch size before cropping.
-        - Returns a cropped tensor with shape (C, patch_size, patch_size).
-        """
-        # Convert numpy arrays to torch tensors if necessary
-        if not torch.is_tensor(img):
-            img = torch.from_numpy(img).float()
-            # if HxW -> add channel dim
-            if img.dim() == 2:
-                img = img.unsqueeze(0)
-            # if HxWxC (rare), move channels to front
-            elif img.dim() == 3 and img.shape[2] in (1, 3) and img.shape[0] not in (1, 3):
-                img = img.permute(2, 0, 1).contiguous()
-
-        # Ensure tensor is C x H x W
-        if img.dim() == 2:
-            img = img.unsqueeze(0)
-        c, h, w = img.shape
-        ph = self.patch_size
-
-        # If image is smaller than patch, pad symmetrically (left/right, top/bottom)
-        pad_h = max(ph - h, 0)
-        pad_w = max(ph - w, 0)
-        if pad_h > 0 or pad_w > 0:
-            # F.pad expects pad as (left, right, top, bottom)
-            pad = (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2)
-            img = F.pad(img, pad, mode='constant', value=0.0)
-            _, h, w = img.shape
-
-        # Now sample a random top-left corner within valid range
-        i = random.randint(0, h - ph) if h - ph > 0 else 0
-        j = random.randint(0, w - ph) if w - ph > 0 else 0
-
-        return img[:, i:i + ph, j:j + ph]
+        return img[:, i:i + self.patch_size, j:j + self.patch_size]
 
 
 # Make dataloader for training/test
@@ -650,115 +618,115 @@ def train(
             # Set 'requires_grad' of the discriminators as 'False' to avoid computing gradients of the discriminators
             set_requires_grad([D_F, D_Q], False)
 
-            # --- Generator update ---
-            # Zero gradients before the forward (good practice for AMP)
-            G_optim.zero_grad()
-
+            # Generate fake images using the generators and compute losses.
+            # When AMP is enabled we wrap forward passes in `autocast` and scale the backward steps.
             if scaler is not None:
-                # Mixed precision forward + loss computation
                 with autocast():
                     x_FQ = G_F2Q(x_F)
                     x_QF = G_Q2F(x_Q)
 
-                    # Cyclic / identity
+                    # Generate cyclic images using the generators
                     x_QFQ = G_F2Q(x_QF)
                     x_FQF = G_Q2F(x_FQ)
+
+                    # Generate identity images using the generators
                     x_QQ = G_F2Q(x_Q)
                     x_FF = G_Q2F(x_F)
 
-                    # Compute discriminator predictions once and reuse
-                    D_pred_Q_from_F = D_Q(x_FQ)
-                    D_pred_F_from_Q = D_F(x_QF)
+                    # Calculate adversarial losses
+                    G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
+                    G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
 
-                    # Generator adversarial losses (LSGAN)
-                    G_adv_loss_F = adv_loss(D_pred_F_from_Q, torch.ones_like(D_pred_F_from_Q))
-                    G_adv_loss_Q = adv_loss(D_pred_Q_from_F, torch.ones_like(D_pred_Q_from_F))
-
-                    # Cycle & identity losses
+                    # Calculate cycle losses
                     G_cycle_loss_F = cycle_loss(x_FQF, x_F)
                     G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
+
+                    # Calculate identity losses
                     G_iden_loss_F = iden_loss(x_FF, x_F)
                     G_iden_loss_Q = iden_loss(x_QQ, x_Q)
 
-                    G_total_loss = (G_adv_loss_F + G_adv_loss_Q) + lambda_cycle * (G_cycle_loss_F + G_cycle_loss_Q) + lambda_iden * (G_iden_loss_F + G_iden_loss_Q)
+                    # Calculate total losses
+                    G_adv_loss = G_adv_loss_F + G_adv_loss_Q
+                    G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
+                    G_iden_loss = G_iden_loss_F + G_iden_loss_Q
+                    G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
 
-                # Backprop with scaler
+                G_optim.zero_grad()
                 scaler.scale(G_total_loss).backward()
                 scaler.step(G_optim)
                 scaler.update()
             else:
-                # Standard precision path
                 x_FQ = G_F2Q(x_F)
                 x_QF = G_Q2F(x_Q)
 
+                # Generate cyclic images using the generators
                 x_QFQ = G_F2Q(x_QF)
                 x_FQF = G_Q2F(x_FQ)
+
+                # Generate identity images using the generators
                 x_QQ = G_F2Q(x_Q)
                 x_FF = G_Q2F(x_F)
 
-                D_pred_Q_from_F = D_Q(x_FQ)
-                D_pred_F_from_Q = D_F(x_QF)
+                # Calculate adversarial losses
+                G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
+                G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
 
-                G_adv_loss_F = adv_loss(D_pred_F_from_Q, torch.ones_like(D_pred_F_from_Q))
-                G_adv_loss_Q = adv_loss(D_pred_Q_from_F, torch.ones_like(D_pred_Q_from_F))
-
+                # Calculate cycle losses
                 G_cycle_loss_F = cycle_loss(x_FQF, x_F)
                 G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
+
+                # Calculate identity losses
                 G_iden_loss_F = iden_loss(x_FF, x_F)
                 G_iden_loss_Q = iden_loss(x_QQ, x_Q)
 
-                G_total_loss = (G_adv_loss_F + G_adv_loss_Q) + lambda_cycle * (G_cycle_loss_F + G_cycle_loss_Q) + lambda_iden * (G_iden_loss_F + G_iden_loss_Q)
+                # Calculate total losses
+                G_adv_loss = G_adv_loss_F + G_adv_loss_Q
+                G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
+                G_iden_loss = G_iden_loss_F + G_iden_loss_Q
+                G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
 
+                # Update the generators
+                G_optim.zero_grad()
                 G_total_loss.backward()
                 G_optim.step()
 
-            # --- Discriminator update ---
-            # Enable gradients for discriminators
+            # Set 'requires_grad' of the discriminators as 'True'
             set_requires_grad([D_F, D_Q], True)
 
-            D_optim.zero_grad()
+            # Calculate adversarial losses for the discriminators
             if scaler is not None:
                 with autocast():
-                    D_real_F = D_F(x_F)
-                    D_fake_F = D_F(x_QF.detach())
-                    D_adv_loss_F = adv_loss(D_real_F, torch.ones_like(D_real_F)) + adv_loss(D_fake_F, torch.zeros_like(D_fake_F))
+                    D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
+                    D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
+                    D_total_loss_F = D_adv_loss_F / 2.0
+                    D_total_loss_Q = D_adv_loss_Q / 2.0
 
-                    D_real_Q = D_Q(x_Q)
-                    D_fake_Q = D_Q(x_FQ.detach())
-                    D_adv_loss_Q = adv_loss(D_real_Q, torch.ones_like(D_real_Q)) + adv_loss(D_fake_Q, torch.zeros_like(D_fake_Q))
-
-                    D_total_loss = 0.5 * (D_adv_loss_F + D_adv_loss_Q)
-
-                # Backprop & step with scaler
-                scaler.scale(D_total_loss).backward()
+                D_optim.zero_grad()
+                scaler.scale(D_total_loss_F + D_total_loss_Q).backward()
                 scaler.step(D_optim)
                 scaler.update()
             else:
-                D_real_F = D_F(x_F)
-                D_fake_F = D_F(x_QF.detach())
-                D_adv_loss_F = adv_loss(D_real_F, torch.ones_like(D_real_F)) + adv_loss(D_fake_F, torch.zeros_like(D_fake_F))
-
-                D_real_Q = D_Q(x_Q)
-                D_fake_Q = D_Q(x_FQ.detach())
-                D_adv_loss_Q = adv_loss(D_real_Q, torch.ones_like(D_real_Q)) + adv_loss(D_fake_Q, torch.zeros_like(D_fake_Q))
-
+                D_adv_loss_F = adv_loss(D_F(x_F), torch.ones_like(D_F(x_F))) + adv_loss(D_F(x_QF.detach()), torch.zeros_like(D_F(x_QF.detach())))
+                D_adv_loss_Q = adv_loss(D_Q(x_Q), torch.ones_like(D_Q(x_Q))) + adv_loss(D_Q(x_FQ.detach()), torch.zeros_like(D_Q(x_FQ.detach())))
                 D_total_loss_F = D_adv_loss_F / 2.0
                 D_total_loss_Q = D_adv_loss_Q / 2.0
 
+                # Update the discriminators
+                D_optim.zero_grad()
                 D_total_loss_F.backward()
                 D_total_loss_Q.backward()
                 D_optim.step()
 
-            # Calculate the average loss during one epoch (store scalar floats)
-            losses['G_adv_loss_F'](G_adv_loss_F.detach().cpu().item())
-            losses['G_adv_loss_Q'](G_adv_loss_Q.detach().cpu().item())
-            losses['G_cycle_loss_F'](G_cycle_loss_F.detach().cpu().item())
-            losses['G_cycle_loss_Q'](G_cycle_loss_Q.detach().cpu().item())
-            losses['G_iden_loss_F'](G_iden_loss_F.detach().cpu().item())
-            losses['G_iden_loss_Q'](G_iden_loss_Q.detach().cpu().item())
-            losses['D_adv_loss_F'](D_adv_loss_F.detach().cpu().item())
-            losses['D_adv_loss_Q'](D_adv_loss_Q.detach().cpu().item())
-
+            # Calculate the average loss during one epoch
+            losses['G_adv_loss_F'](G_adv_loss_F.detach())
+            losses['G_adv_loss_Q'](G_adv_loss_Q.detach())
+            losses['G_cycle_loss_F'](G_cycle_loss_F.detach())
+            losses['G_cycle_loss_Q'](G_cycle_loss_Q.detach())
+            losses['G_iden_loss_F'](G_iden_loss_F.detach())
+            losses['G_iden_loss_Q'](G_iden_loss_Q.detach())
+            losses['D_adv_loss_F'](D_adv_loss_F.detach())
+            losses['D_adv_loss_Q'](D_adv_loss_Q.detach())
+    
         for name in loss_name:
             losses_list[name].append(losses[name].result())
         
