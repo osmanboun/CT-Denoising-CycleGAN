@@ -136,15 +136,47 @@ class CT_Dataset(Dataset):
 # Transform for the random crop
 class RandomCrop(object):
     def __init__(self, patch_size):
-        self.patch_size = patch_size
-    
-    def __call__(self, img):
-        # Randomly crop the image into a patch with the size [self.patch_size, self.patch_size]
-        w, h = img.size(-1), img.size(-2)
-        i = random.randint(0, h - self.patch_size)
-        j = random.randint(0, w - self.patch_size)
+        self.patch_size = int(patch_size)
 
-        return img[:, i:i + self.patch_size, j:j + self.patch_size]
+    def __call__(self, img):
+        """
+        Robust random crop that handles small images.
+
+        - Accepts either a NumPy array (H, W) or a torch.Tensor (C, H, W) / (H, W).
+        - If the image is smaller than the requested patch size, it symmetrically pads
+          the image with zeros to reach at least the patch size before cropping.
+        - Returns a cropped tensor with shape (C, patch_size, patch_size).
+        """
+        # Convert numpy arrays to torch tensors if necessary
+        if not torch.is_tensor(img):
+            img = torch.from_numpy(img).float()
+            # if HxW -> add channel dim
+            if img.dim() == 2:
+                img = img.unsqueeze(0)
+            # if HxWxC (rare), move channels to front
+            elif img.dim() == 3 and img.shape[2] in (1, 3) and img.shape[0] not in (1, 3):
+                img = img.permute(2, 0, 1).contiguous()
+
+        # Ensure tensor is C x H x W
+        if img.dim() == 2:
+            img = img.unsqueeze(0)
+        c, h, w = img.shape
+        ph = self.patch_size
+
+        # If image is smaller than patch, pad symmetrically (left/right, top/bottom)
+        pad_h = max(ph - h, 0)
+        pad_w = max(ph - w, 0)
+        if pad_h > 0 or pad_w > 0:
+            # F.pad expects pad as (left, right, top, bottom)
+            pad = (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2)
+            img = F.pad(img, pad, mode='constant', value=0.0)
+            _, h, w = img.shape
+
+        # Now sample a random top-left corner within valid range
+        i = random.randint(0, h - ph) if h - ph > 0 else 0
+        j = random.randint(0, w - ph) if w - ph > 0 else 0
+
+        return img[:, i:i + ph, j:j + ph]
 
 
 # Make dataloader for training/test
