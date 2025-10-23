@@ -428,7 +428,7 @@ class CBAM(nn.Module):
 # --- Dilated Mid Block ---
 class DilatedMidBlock(nn.Module):
     """Stack of conv layers with increasing dilation to enlarge receptive field without downsampling."""
-    def __init__(self, channels, num_layers=5, base_dilation=1):
+    def __init__(self, channels, num_layers=4, base_dilation=1):
         super().__init__()
         layers = []
         for i in range(num_layers):
@@ -485,7 +485,7 @@ class Generator(nn.Module):
         # Bottleneck: Dilated mid-block + Light RDB + optional CBAM
         bottleneck_channels = ngf * ch_mult[-1]
         self.mid_block = nn.Sequential(
-            DilatedMidBlock(bottleneck_channels, num_layers=5, base_dilation=1),
+            DilatedMidBlock(bottleneck_channels, num_layers=4, base_dilation=1),
             LightRDB(bottleneck_channels, growth=rdb_growth, num_layers=3)
         )
         if self.use_cbam:
@@ -798,7 +798,7 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_iden', type=int, default=5)
     parser.add_argument('--beta1', type=float, default=0.5)
     parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--num_epoch', type=int, default=80)
+    parser.add_argument('--num_epoch', type=int, default=28)
     parser.add_argument('--g_channels', type=int, default=32)
     parser.add_argument('--d_channels', type=int, default=64)
     parser.add_argument('--ch_mult', type=int, nargs='+', default=[1, 2, 4, 8])
