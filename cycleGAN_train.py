@@ -49,6 +49,54 @@ def ssim(A, ref):
     out = structural_similarity(ref, A, data_range=1.0)
     return out
 
+
+# Differentiable SSIM (PyTorch) and helper to map to [0,1]
+def gaussian_window(window_size, sigma, device, dtype):
+    coords = torch.arange(window_size, dtype=dtype, device=device) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    return g.unsqueeze(0)
+
+
+def ssim_loss_torch(x, y, window_size=11, sigma=1.5, data_range=1.0, eps=1e-6):
+    """Differentiable SSIM loss. Returns 1 - mean(SSIM_map) so lower is better.
+    x,y: (B,C,H,W) in [0,1]
+    """
+    B, C, H, W = x.shape
+    dtype = x.dtype
+    device = x.device
+    gw = gaussian_window(window_size, sigma, device, dtype)  # (1, window)
+    gw2d = gw.t() @ gw  # (window, window)
+    gw2d = gw2d / gw2d.sum()
+    gw2d = gw2d.expand(C, 1, window_size, window_size)
+
+    mu_x = F.conv2d(x, gw2d, padding=window_size // 2, groups=C)
+    mu_y = F.conv2d(y, gw2d, padding=window_size // 2, groups=C)
+
+    mu_x2 = mu_x * mu_x
+    mu_y2 = mu_y * mu_y
+    mu_xy = mu_x * mu_y
+
+    sigma_x2 = F.conv2d(x * x, gw2d, padding=window_size // 2, groups=C) - mu_x2
+    sigma_y2 = F.conv2d(y * y, gw2d, padding=window_size // 2, groups=C) - mu_y2
+    sigma_xy = F.conv2d(x * y, gw2d, padding=window_size // 2, groups=C) - mu_xy
+
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+
+    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / ((mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2) + eps)
+    return 1.0 - ssim_map.mean()
+
+
+def to_unit(x, min_hu=-1000.0, max_hu=3000.0):
+    """Convert normalized tensor x (assumed divided by 4000 earlier) back to HU and map to [0,1].
+    x: torch tensor (B,C,H,W) or (C,H,W)
+    """
+    x_hu = x * 4000.0  # revert normalization done in dataset
+    x_hu = torch.clamp(x_hu, min=min_hu, max=max_hu)
+    x_u = (x_hu - min_hu) / (max_hu - min_hu)
+    return x_u
+
 # Initialize parameters of neural networks
 def init_weights(net):
     def init_func(m):
@@ -590,6 +638,8 @@ def train(
     batch_size=16,
     lambda_cycle=10,
     lambda_iden=5,
+    lambda_l1=1.0,
+    lambda_ssim=3.0,
     beta1=0.5,
     beta2=0.999,
     num_epoch=100,
@@ -598,6 +648,9 @@ def train(
     ch_mult=[1, 2, 4, 8],
     num_res_blocks=3,
     lr=2e-4,
+    # adversarial weight annealing (linear): start and end values
+    lambda_adv_init=1.0,
+    lambda_adv_final=0.1,
     use_checkpoint=False
 ):
     # Hyperparameters
@@ -640,12 +693,15 @@ def train(
     # Loss functions
     loss_name = ['G_adv_loss_F',
                 'G_adv_loss_Q',
+                'G_recon_loss',
+                'G_ssim_loss',
                 'G_cycle_loss_F',
                 'G_cycle_loss_Q',
                 'G_iden_loss_F',
                 'G_iden_loss_Q',
                 'D_adv_loss_F',
-                'D_adv_loss_Q']
+                'D_adv_loss_Q',
+                'G_adv_weight']
 
     if use_checkpoint:
         # If a checkpoint exists, load the state of the model and optimizer from the checkpoint
@@ -674,6 +730,15 @@ def train(
     for epoch in tqdm(range(trained_epoch, num_epoch), desc='Epoch', total=num_epoch, initial=trained_epoch):
         # Initialize a dictionary to store the mean losses for this epoch
         losses = {name: Mean() for name in loss_name}
+
+        # Linear annealing of adversarial weight across epochs (lambda_adv_init -> lambda_adv_final)
+        if num_epoch > 1:
+            t = float(epoch) / float(max(1, num_epoch - 1))
+            current_lambda_adv = float(lambda_adv_init) + (float(lambda_adv_final) - float(lambda_adv_init)) * t
+        else:
+            current_lambda_adv = float(lambda_adv_final)
+        if current_lambda_adv < 0.0:
+            current_lambda_adv = 0.0
 
         for x_F, x_Q, _ in tqdm(train_dataloader, desc='Step'):
             # Move the data to the device (GPU or CPU)
@@ -710,11 +775,28 @@ def train(
                 G_iden_loss_F = iden_loss(x_FF, x_F)
                 G_iden_loss_Q = iden_loss(x_QQ, x_Q)
 
-                # Total generator losses
+                # Reconstruction (L1) losses between generated and target images
+                recon_loss = nn.L1Loss()
+                G_recon_loss_F = recon_loss(x_QF, x_F)
+                G_recon_loss_Q = recon_loss(x_FQ, x_Q)
+                G_recon_loss = G_recon_loss_F + G_recon_loss_Q
+
+                # SSIM losses (compute on unit-scaled images in [0,1])
+                x_Q_unit = to_unit(x_Q)
+                x_QF_unit = to_unit(x_QF)
+                x_F_unit = to_unit(x_F)
+                x_FQ_unit = to_unit(x_FQ)
+
+                G_ssim_loss_F = ssim_loss_torch(x_QF_unit, x_F_unit)
+                G_ssim_loss_Q = ssim_loss_torch(x_FQ_unit, x_Q_unit)
+                G_ssim_loss = G_ssim_loss_F + G_ssim_loss_Q
+
                 G_adv_loss = G_adv_loss_F + G_adv_loss_Q
                 G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
                 G_iden_loss = G_iden_loss_F + G_iden_loss_Q
-                G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
+
+                # Primary combined objective: L1 + SSIM (for PSNR/SSIM improvements)
+                G_total_loss = lambda_l1 * G_recon_loss + lambda_ssim * G_ssim_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss) + current_lambda_adv * G_adv_loss
 
             # Update the generators with scaled gradients
             G_optim.zero_grad()
@@ -742,12 +824,16 @@ def train(
             # Calculate the average loss during one epoch
             losses['G_adv_loss_F'](G_adv_loss_F.detach())
             losses['G_adv_loss_Q'](G_adv_loss_Q.detach())
+            losses['G_recon_loss'](G_recon_loss.detach())
+            losses['G_ssim_loss'](G_ssim_loss.detach())
             losses['G_cycle_loss_F'](G_cycle_loss_F.detach())
             losses['G_cycle_loss_Q'](G_cycle_loss_Q.detach())
             losses['G_iden_loss_F'](G_iden_loss_F.detach())
             losses['G_iden_loss_Q'](G_iden_loss_Q.detach())
             losses['D_adv_loss_F'](D_adv_loss_F.detach())
             losses['D_adv_loss_Q'](D_adv_loss_Q.detach())
+            # record current adversarial weight (same value across the epoch)
+            losses['G_adv_weight'](current_lambda_adv)
 
         for name in loss_name:
             losses_list[name].append(losses[name].result())
@@ -806,6 +892,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--use_checkpoint', action='store_true')
+    parser.add_argument('--lambda_adv_init', type=float, default=1.0)
+    parser.add_argument('--lambda_adv_final', type=float, default=0.1)
     
     args = parser.parse_args()
     
