@@ -648,9 +648,6 @@ def train(
     ch_mult=[1, 2, 4, 8],
     num_res_blocks=3,
     lr=2e-4,
-    # adversarial weight annealing (linear): start and end values
-    lambda_adv_init=1.0,
-    lambda_adv_final=0.1,
     use_checkpoint=False
 ):
     # Hyperparameters
@@ -700,8 +697,7 @@ def train(
                 'G_iden_loss_F',
                 'G_iden_loss_Q',
                 'D_adv_loss_F',
-                'D_adv_loss_Q',
-                'G_adv_weight']
+                'D_adv_loss_Q']
 
     if use_checkpoint:
         # If a checkpoint exists, load the state of the model and optimizer from the checkpoint
@@ -730,15 +726,6 @@ def train(
     for epoch in tqdm(range(trained_epoch, num_epoch), desc='Epoch', total=num_epoch, initial=trained_epoch):
         # Initialize a dictionary to store the mean losses for this epoch
         losses = {name: Mean() for name in loss_name}
-
-        # Linear annealing of adversarial weight across epochs (lambda_adv_init -> lambda_adv_final)
-        if num_epoch > 1:
-            t = float(epoch) / float(max(1, num_epoch - 1))
-            current_lambda_adv = float(lambda_adv_init) + (float(lambda_adv_final) - float(lambda_adv_init)) * t
-        else:
-            current_lambda_adv = float(lambda_adv_final)
-        if current_lambda_adv < 0.0:
-            current_lambda_adv = 0.0
 
         for x_F, x_Q, _ in tqdm(train_dataloader, desc='Step'):
             # Move the data to the device (GPU or CPU)
@@ -796,7 +783,7 @@ def train(
                 G_iden_loss = G_iden_loss_F + G_iden_loss_Q
 
                 # Primary combined objective: L1 + SSIM (for PSNR/SSIM improvements)
-                G_total_loss = lambda_l1 * G_recon_loss + lambda_ssim * G_ssim_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss) + current_lambda_adv * G_adv_loss
+                G_total_loss = lambda_l1 * G_recon_loss + lambda_ssim * G_ssim_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss) + G_adv_loss
 
             # Update the generators with scaled gradients
             G_optim.zero_grad()
@@ -832,8 +819,6 @@ def train(
             losses['G_iden_loss_Q'](G_iden_loss_Q.detach())
             losses['D_adv_loss_F'](D_adv_loss_F.detach())
             losses['D_adv_loss_Q'](D_adv_loss_Q.detach())
-            # record current adversarial weight (same value across the epoch)
-            losses['G_adv_weight'](current_lambda_adv)
 
         for name in loss_name:
             losses_list[name].append(losses[name].result())
@@ -892,8 +877,6 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--use_checkpoint', action='store_true')
-    parser.add_argument('--lambda_adv_init', type=float, default=1.0)
-    parser.add_argument('--lambda_adv_final', type=float, default=0.1)
     
     args = parser.parse_args()
     
