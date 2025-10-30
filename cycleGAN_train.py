@@ -50,65 +50,64 @@ def ssim(A, ref):
     return out
 
 
-# --- Differentiable SSIM (PyTorch) -----------------
-# This implementation follows the common SSIM formula using a gaussian window and is
-# differentiable so it can be used directly as a training loss. It returns a value
-# in [0,1] (higher = more similar). For a loss, use (1 - ssim).
-import math
-
-def _gaussian(window_size, sigma):
-    gauss = torch.Tensor([math.exp(-(x - window_size//2)**2/(2*sigma**2)) for x in range(window_size)])
-    return gauss / gauss.sum()
-
-
-def _create_window(window_size, channel, device, dtype):
-    _1D_window = _gaussian(window_size, 1.5).unsqueeze(1)
-    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
-    window = _2D_window.repeat(channel, 1, 1, 1).to(device=device, dtype=dtype)
-    return window
-
-
-def ssim_torch(img1, img2, window_size=11, size_average=True, val_range=1.0):
-    """Compute SSIM between img1 and img2 (expects tensors in shape [B,C,H,W]).
-    Returns mean SSIM over batch if size_average True, otherwise per-image SSIM.
+# --- Differentiable SSIM for PyTorch tensors ---
+def ssim_torch(img1, img2, window_size=11, size_average=True, val_range=None):
+    """Compute SSIM (differentiable) between img1 and img2.
+    Expects img tensors in shape (B, C, H, W).
+    Returns a scalar (mean SSIM over batch/channel/space) if size_average is True.
     """
-    # Ensure inputs are float tensors
-    if img1.dtype != torch.float32:
-        img1 = img1.float()
-    if img2.dtype != torch.float32:
-        img2 = img2.float()
+    # ensure float
+    img1 = img1.float()
+    img2 = img2.float()
 
-    _, channel, _, _ = img1.size()
-    device = img1.device
-    window = _create_window(window_size, channel, device, img1.dtype)
+    if val_range is None:
+        max_val = torch.max(torch.max(img1), torch.max(img2))
+        min_val = torch.min(torch.min(img1), torch.min(img2))
+        L = (max_val - min_val).detach()
+        if L == 0:
+            L = 1.0
+    else:
+        L = float(val_range)
 
-    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
-    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
+    C1 = (0.01 * L) ** 2
+    C2 = (0.03 * L) ** 2
 
-    mu1_sq = mu1.pow(2)
-    mu2_sq = mu2.pow(2)
+    # create gaussian window
+    def _gaussian(window_size, sigma):
+        coords = torch.arange(window_size).float() - window_size // 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        return g / g.sum()
+
+    sigma = 1.5
+    _1d = _gaussian(window_size, sigma).to(img1.device, dtype=img1.dtype)
+    _2d = _1d.unsqueeze(1) @ _1d.unsqueeze(0)
+    window = _2d.unsqueeze(0).unsqueeze(0)  # 1 x 1 x W x W
+    padding = window_size // 2
+
+    # expand window to number of channels for grouped conv
+    channels = img1.shape[1]
+    window = window.expand(channels, 1, window_size, window_size).contiguous()
+
+    mu1 = F.conv2d(img1, window, groups=channels, padding=padding)
+    mu2 = F.conv2d(img2, window, groups=channels, padding=padding)
+
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
     mu1_mu2 = mu1 * mu2
 
-    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=channel) - mu1_sq
-    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=channel) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=channel) - mu1_mu2
-
-    C1 = (0.01 * val_range) ** 2
-    C2 = (0.03 * val_range) ** 2
+    sigma1_sq = F.conv2d(img1 * img1, window, groups=channels, padding=padding) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, groups=channels, padding=padding) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, groups=channels, padding=padding) - mu1_mu2
 
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
 
     if size_average:
         return ssim_map.mean()
     else:
-        # return per-image mean over channels and spatial dims
-        return ssim_map.view(ssim_map.size(0), -1).mean(dim=1)
-
-# ---------------------------------------------------
-
+        # return per-sample-per-channel map averaged spatially
+        return ssim_map.mean([2,3])
 
 # Initialize parameters of neural networks
-def init_weights(net):# Initialize parameters of neural networks
 def init_weights(net):
     def init_func(m):
         classname = m.__class__.__name__
@@ -695,9 +694,15 @@ def train(
     # Define loss functions
     adv_loss = nn.MSELoss()
     l1_loss = nn.L1Loss()
-    # lambda_ssim is a float that weights the SSIM term in the combined image loss.
-    # We use a combined image loss for cycle/identity: L_img = L1 + lambda_ssim * (1 - SSIM)
-    # (SSIM is computed with ssim_torch defined above and returns values in [0,1]).
+
+    # combined L1 + SSIM helper (SSIM measured with ssim_torch)
+    def combined_l1_ssim(a, b):
+        # a, b: tensors (B,C,H,W)
+        l1 = l1_loss(a, b)
+        # clamp tiny range differences to avoid NaNs
+        ssim_val = ssim_torch(a, b)
+        ssim_term = 1.0 - ssim_val
+        return l1 + lambda_ssim * ssim_term
 
     # Loss functions
     loss_name = ['G_adv_loss_F',
@@ -762,25 +767,13 @@ def train(
 
                 # Calculate adversarial losses (generators try to fool discriminators)
                 G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
-                G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
-                # Calculate cycle losses using combined L1 + SSIM objective
-                # SSIM loss = 1 - ssim_torch(pred, target)
-                G_cycle_loss_F_l1 = l1_loss(x_FQF, x_F)
-                G_cycle_loss_F_ssim = 1.0 - ssim_torch(x_FQF, x_F)
-                G_cycle_loss_F = G_cycle_loss_F_l1 + lambda_ssim * G_cycle_loss_F_ssim
+                G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))                # Calculate cycle losses (combined L1 + SSIM)
+                G_cycle_loss_F = combined_l1_ssim(x_FQF, x_F)
+                G_cycle_loss_Q = combined_l1_ssim(x_QFQ, x_Q)
 
-                G_cycle_loss_Q_l1 = l1_loss(x_QFQ, x_Q)
-                G_cycle_loss_Q_ssim = 1.0 - ssim_torch(x_QFQ, x_Q)
-                G_cycle_loss_Q = G_cycle_loss_Q_l1 + lambda_ssim * G_cycle_loss_Q_ssim
-
-                # Calculate identity losses using the same combined objective
-                G_iden_loss_F_l1 = l1_loss(x_FF, x_F)
-                G_iden_loss_F_ssim = 1.0 - ssim_torch(x_FF, x_F)
-                G_iden_loss_F = G_iden_loss_F_l1 + lambda_ssim * G_iden_loss_F_ssim
-
-                G_iden_loss_Q_l1 = l1_loss(x_QQ, x_Q)
-                G_iden_loss_Q_ssim = 1.0 - ssim_torch(x_QQ, x_Q)
-                G_iden_loss_Q = G_iden_loss_Q_l1 + lambda_ssim * G_iden_loss_Q_ssim
+                # Calculate identity losses (combined L1 + SSIM)
+                G_iden_loss_F = combined_l1_ssim(x_FF, x_F)
+                G_iden_loss_Q = combined_l1_ssim(x_QQ, x_Q)
 
                 # Total generator losses
                 G_adv_loss = G_adv_loss_F + G_adv_loss_Q
@@ -870,6 +863,7 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_iden', type=int, default=5)
     parser.add_argument('--beta1', type=float, default=0.5)
     parser.add_argument('--beta2', type=float, default=0.999)
+    parser.add_argument('--lambda_ssim', type=float, default=1.0)
     parser.add_argument('--num_epoch', type=int, default=28)
     parser.add_argument('--g_channels', type=int, default=32)
     parser.add_argument('--d_channels', type=int, default=64)
@@ -877,7 +871,6 @@ if __name__ == '__main__':
     parser.add_argument('--num_res_blocks', type=int, default=3)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--lambda_ssim', type=float, default=1.0)
     parser.add_argument('--use_checkpoint', action='store_true')
     
     args = parser.parse_args()
@@ -892,6 +885,7 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         lambda_cycle=args.lambda_cycle,
         lambda_iden=args.lambda_iden,
+        lambda_ssim=args.lambda_ssim,
         beta1=args.beta1,
         beta2=args.beta2,
         num_epoch=args.num_epoch,
