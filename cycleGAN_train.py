@@ -18,147 +18,97 @@ from tqdm.auto import tqdm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 
-# Functions for calculating PSNR, SSIM on a fixed HU/window and optional region-of-interest (mask)
-# Map numpy image (HU-scaled) to unit range [0,1] using fixed window
-def _map_to_unit_np(img, min_hu=-1000.0, max_hu=3000.0):
-    img_u = img.copy().astype(np.float32)
-    # clamp to window
-    img_u = np.clip(img_u, min_hu, max_hu)
-    # map to [0,1]
-    img_u = (img_u - min_hu) / (max_hu - min_hu)
-    return img_u
-
-# helper to compute bounding box of a boolean mask
-def _mask_bbox(mask):
-    ys, xs = np.where(mask)
-    if ys.size == 0:
-        return None
-    y0, y1 = ys.min(), ys.max() + 1
-    x0, x1 = xs.min(), xs.max() + 1
-    return y0, y1, x0, x1
-
-# Peak Signal-to-Noise Ratio computed on a fixed HU window and optional mask/ROI
-def psnr(A, ref, min_hu=-1000.0, max_hu=3000.0, mask=None):
-    """Compute PSNR between A and ref.
-    Both A and ref are numpy arrays in HU units (or already clipped to HU). This function will
-    clamp both to [min_hu, max_hu], map them to [0,1], and compute PSNR. If `mask` is provided
-    (boolean array same HxW), the metric is computed only inside the mask bounding box (cropped).
-    """
-    ref = ref.copy().astype(np.float32)
-    A = A.copy().astype(np.float32)
-
-    # Map to [0,1] using fixed window
-    ref_u = _map_to_unit_np(ref, min_hu, max_hu)
-    A_u = _map_to_unit_np(A, min_hu, max_hu)
-
-    # If mask supplied, crop to mask bbox for consistent region
-    if mask is not None:
-        mask_bool = mask.astype(bool)
-        if mask_bool.shape != ref_u.shape:
-            raise ValueError('Mask shape must match image shape for PSNR/SSIM computation')
-        bbox = _mask_bbox(mask_bool)
-        if bbox is not None:
-            y0, y1, x0, x1 = bbox
-            ref_u = ref_u[y0:y1, x0:x1]
-            A_u = A_u[y0:y1, x0:x1]
-        else:
-            # empty mask -> fallback to whole image
-            pass
-
-    # If the reference has zero dynamic range after windowing, return 0.0
-    if np.ptp(ref_u) == 0:
+# Functions for caculating PSNR, SSIM
+# Peak Signal-to-Noise Ratio
+def psnr(A, ref):
+    ref = ref.copy()
+    A = A.copy()
+    ref[ref < -1000] = -1000
+    A[A < -1000] = -1000
+    val_min = -1000
+    val_max = np.amax(ref)
+    if val_max == val_min:
         return 0.0
+    ref = (ref - val_min) / (val_max - val_min)
+    A = (A - val_min) / (val_max - val_min)
+    out = peak_signal_noise_ratio(ref, A, data_range=1.0)
+    return out
 
-    return peak_signal_noise_ratio(ref_u, A_u, data_range=1.0)
-
-# Structural similarity index (fixed HU window, optional mask)
-def ssim(A, ref, min_hu=-1000.0, max_hu=3000.0, mask=None):
-    """Compute SSIM between A and ref with a fixed HU window and optional mask/ROI.
-    Returns SSIM in the usual [ -1, 1 ] range (skimage returns up to 1.0).
-    """
-    ref = ref.copy().astype(np.float32)
-    A = A.copy().astype(np.float32)
-
-    # Map to [0,1]
-    ref_u = _map_to_unit_np(ref, min_hu, max_hu)
-    A_u = _map_to_unit_np(A, min_hu, max_hu)
-
-    # If mask supplied, crop to mask bbox for consistent region
-    if mask is not None:
-        mask_bool = mask.astype(bool)
-        if mask_bool.shape != ref_u.shape:
-            raise ValueError('Mask shape must match image shape for PSNR/SSIM computation')
-        bbox = _mask_bbox(mask_bool)
-        if bbox is not None:
-            y0, y1, x0, x1 = bbox
-            ref_u = ref_u[y0:y1, x0:x1]
-            A_u = A_u[y0:y1, x0:x1]
-        else:
-            # empty mask -> fallback to whole image
-            pass
-
-    # If the reference has zero dynamic range after windowing, return 0.0
-    if np.ptp(ref_u) == 0:
+# Structural similarity index
+def ssim(A, ref):
+    ref = ref.copy()
+    A = A.copy()
+    ref[ref < -1000] = -1000
+    A[A < -1000] = -1000
+    val_min = -1000
+    val_max = np.amax(ref)
+    if val_max == val_min:
         return 0.0
-
-    return structural_similarity(ref_u, A_u, data_range=1.0)
-
-# Convenience function to compute both metrics at once
-def compute_metrics(A, ref, min_hu=-1000.0, max_hu=3000.0, mask=None):
-    """Return (psnr_val, ssim_val) computed on the fixed window and optional mask/ROI."""
-    p = psnr(A, ref, min_hu=min_hu, max_hu=max_hu, mask=mask)
-    s = ssim(A, ref, min_hu=min_hu, max_hu=max_hu, mask=mask)
-    return p, s
+    ref = (ref - val_min) / (val_max - val_min)
+    A = (A - val_min) / (val_max - val_min)
+    out = structural_similarity(ref, A, data_range=1.0)
+    return out
 
 
-# Differentiable SSIM (PyTorch) and helper to map to [0,1]
-def gaussian_window(window_size, sigma, device, dtype):
-    coords = torch.arange(window_size, dtype=dtype, device=device) - window_size // 2
-    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
-    g = g / g.sum()
-    return g.unsqueeze(0)
+# --- Differentiable SSIM (PyTorch) -----------------
+# This implementation follows the common SSIM formula using a gaussian window and is
+# differentiable so it can be used directly as a training loss. It returns a value
+# in [0,1] (higher = more similar). For a loss, use (1 - ssim).
+import math
+
+def _gaussian(window_size, sigma):
+    gauss = torch.Tensor([math.exp(-(x - window_size//2)**2/(2*sigma**2)) for x in range(window_size)])
+    return gauss / gauss.sum()
 
 
-def ssim_loss_torch(x, y, window_size=11, sigma=1.5, data_range=1.0, eps=1e-6):
-    """Differentiable SSIM loss. Returns 1 - mean(SSIM_map) so lower is better.
-    x,y: (B,C,H,W) in [0,1]
+def _create_window(window_size, channel, device, dtype):
+    _1D_window = _gaussian(window_size, 1.5).unsqueeze(1)
+    _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
+    window = _2D_window.repeat(channel, 1, 1, 1).to(device=device, dtype=dtype)
+    return window
+
+
+def ssim_torch(img1, img2, window_size=11, size_average=True, val_range=1.0):
+    """Compute SSIM between img1 and img2 (expects tensors in shape [B,C,H,W]).
+    Returns mean SSIM over batch if size_average True, otherwise per-image SSIM.
     """
-    B, C, H, W = x.shape
-    dtype = x.dtype
-    device = x.device
-    gw = gaussian_window(window_size, sigma, device, dtype)  # (1, window)
-    gw2d = gw.t() @ gw  # (window, window)
-    gw2d = gw2d / gw2d.sum()
-    gw2d = gw2d.expand(C, 1, window_size, window_size)
+    # Ensure inputs are float tensors
+    if img1.dtype != torch.float32:
+        img1 = img1.float()
+    if img2.dtype != torch.float32:
+        img2 = img2.float()
 
-    mu_x = F.conv2d(x, gw2d, padding=window_size // 2, groups=C)
-    mu_y = F.conv2d(y, gw2d, padding=window_size // 2, groups=C)
+    _, channel, _, _ = img1.size()
+    device = img1.device
+    window = _create_window(window_size, channel, device, img1.dtype)
 
-    mu_x2 = mu_x * mu_x
-    mu_y2 = mu_y * mu_y
-    mu_xy = mu_x * mu_y
+    mu1 = F.conv2d(img1, window, padding=window_size//2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size//2, groups=channel)
 
-    sigma_x2 = F.conv2d(x * x, gw2d, padding=window_size // 2, groups=C) - mu_x2
-    sigma_y2 = F.conv2d(y * y, gw2d, padding=window_size // 2, groups=C) - mu_y2
-    sigma_xy = F.conv2d(x * y, gw2d, padding=window_size // 2, groups=C) - mu_xy
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
 
-    C1 = (0.01 * data_range) ** 2
-    C2 = (0.03 * data_range) ** 2
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size//2, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size//2, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size//2, groups=channel) - mu1_mu2
 
-    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / ((mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2) + eps)
-    return 1.0 - ssim_map.mean()
+    C1 = (0.01 * val_range) ** 2
+    C2 = (0.03 * val_range) ** 2
 
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
 
-def to_unit(x, min_hu=-1000.0, max_hu=3000.0):
-    """Convert normalized tensor x (assumed divided by 4000 earlier) back to HU and map to [0,1].
-    x: torch tensor (B,C,H,W) or (C,H,W)
-    """
-    x_hu = x * 4000.0  # revert normalization done in dataset
-    x_hu = torch.clamp(x_hu, min=min_hu, max=max_hu)
-    x_u = (x_hu - min_hu) / (max_hu - min_hu)
-    return x_u
+    if size_average:
+        return ssim_map.mean()
+    else:
+        # return per-image mean over channels and spatial dims
+        return ssim_map.view(ssim_map.size(0), -1).mean(dim=1)
+
+# ---------------------------------------------------
+
 
 # Initialize parameters of neural networks
+def init_weights(net):# Initialize parameters of neural networks
 def init_weights(net):
     def init_func(m):
         classname = m.__class__.__name__
@@ -699,8 +649,7 @@ def train(
     batch_size=16,
     lambda_cycle=10,
     lambda_iden=5,
-    lambda_l1=1.0,
-    lambda_ssim=3.0,
+    lambda_ssim=1.0,
     beta1=0.5,
     beta2=0.999,
     num_epoch=100,
@@ -709,9 +658,6 @@ def train(
     ch_mult=[1, 2, 4, 8],
     num_res_blocks=3,
     lr=2e-4,
-    # adversarial weight annealing: start and final values (linear interpolation across epochs)
-    lambda_adv_init=1.0,
-    lambda_adv_final=0.1,
     use_checkpoint=False
 ):
     # Hyperparameters
@@ -748,23 +694,20 @@ def train(
 
     # Define loss functions
     adv_loss = nn.MSELoss()
-    cycle_loss = nn.L1Loss()
-    iden_loss = nn.L1Loss()
+    l1_loss = nn.L1Loss()
+    # lambda_ssim is a float that weights the SSIM term in the combined image loss.
+    # We use a combined image loss for cycle/identity: L_img = L1 + lambda_ssim * (1 - SSIM)
+    # (SSIM is computed with ssim_torch defined above and returns values in [0,1]).
 
     # Loss functions
-    loss_name = [
-                'G_adv_loss_F',
+    loss_name = ['G_adv_loss_F',
                 'G_adv_loss_Q',
-                'G_recon_loss',
-                'G_ssim_loss',
                 'G_cycle_loss_F',
                 'G_cycle_loss_Q',
                 'G_iden_loss_F',
                 'G_iden_loss_Q',
                 'D_adv_loss_F',
-                'D_adv_loss_Q',
-                'G_adv_weight'
-            ]
+                'D_adv_loss_Q']
 
     if use_checkpoint:
         # If a checkpoint exists, load the state of the model and optimizer from the checkpoint
@@ -794,21 +737,6 @@ def train(
         # Initialize a dictionary to store the mean losses for this epoch
         losses = {name: Mean() for name in loss_name}
 
-        # --- adversarial weight annealing (linear interpolation) ---
-        # Compute current adversarial weight that linearly moves from lambda_adv_init -> lambda_adv_final across epochs
-        if num_epoch > 1:
-            t = float(epoch) / float(max(1, num_epoch - 1))
-            current_lambda_adv = float(lambda_adv_init) + (float(lambda_adv_final) - float(lambda_adv_init)) * t
-        else:
-            current_lambda_adv = float(lambda_adv_final)
-
-        # (optional) clamp to non-negative
-        if current_lambda_adv < 0.0:
-            current_lambda_adv = 0.0
-
-        # You can monitor `current_lambda_adv` in losses['G_adv_weight'] during training
-
-
         for x_F, x_Q, _ in tqdm(train_dataloader, desc='Step'):
             # Move the data to the device (GPU or CPU)
             x_F = x_F.to(device)
@@ -835,37 +763,30 @@ def train(
                 # Calculate adversarial losses (generators try to fool discriminators)
                 G_adv_loss_F = adv_loss(D_F(x_QF), torch.ones_like(D_F(x_QF)))
                 G_adv_loss_Q = adv_loss(D_Q(x_FQ), torch.ones_like(D_Q(x_FQ)))
+                # Calculate cycle losses using combined L1 + SSIM objective
+                # SSIM loss = 1 - ssim_torch(pred, target)
+                G_cycle_loss_F_l1 = l1_loss(x_FQF, x_F)
+                G_cycle_loss_F_ssim = 1.0 - ssim_torch(x_FQF, x_F)
+                G_cycle_loss_F = G_cycle_loss_F_l1 + lambda_ssim * G_cycle_loss_F_ssim
 
-                # Calculate cycle losses
-                G_cycle_loss_F = cycle_loss(x_FQF, x_F)
-                G_cycle_loss_Q = cycle_loss(x_QFQ, x_Q)
+                G_cycle_loss_Q_l1 = l1_loss(x_QFQ, x_Q)
+                G_cycle_loss_Q_ssim = 1.0 - ssim_torch(x_QFQ, x_Q)
+                G_cycle_loss_Q = G_cycle_loss_Q_l1 + lambda_ssim * G_cycle_loss_Q_ssim
 
-                # Calculate identity losses
-                G_iden_loss_F = iden_loss(x_FF, x_F)
-                G_iden_loss_Q = iden_loss(x_QQ, x_Q)
+                # Calculate identity losses using the same combined objective
+                G_iden_loss_F_l1 = l1_loss(x_FF, x_F)
+                G_iden_loss_F_ssim = 1.0 - ssim_torch(x_FF, x_F)
+                G_iden_loss_F = G_iden_loss_F_l1 + lambda_ssim * G_iden_loss_F_ssim
 
-                # Reconstruction (L1) losses between generated and target images
-                recon_loss = nn.L1Loss()
-                G_recon_loss_F = recon_loss(x_QF, x_F)
-                G_recon_loss_Q = recon_loss(x_FQ, x_Q)
-                G_recon_loss = G_recon_loss_F + G_recon_loss_Q
+                G_iden_loss_Q_l1 = l1_loss(x_QQ, x_Q)
+                G_iden_loss_Q_ssim = 1.0 - ssim_torch(x_QQ, x_Q)
+                G_iden_loss_Q = G_iden_loss_Q_l1 + lambda_ssim * G_iden_loss_Q_ssim
 
-                # SSIM losses (compute on unit-scaled images in [0,1])
-                x_Q_unit = to_unit(x_Q)
-                x_QF_unit = to_unit(x_QF)
-                x_F_unit = to_unit(x_F)
-                x_FQ_unit = to_unit(x_FQ)
-
-                G_ssim_loss_F = ssim_loss_torch(x_QF_unit, x_F_unit)
-                G_ssim_loss_Q = ssim_loss_torch(x_FQ_unit, x_Q_unit)
-                G_ssim_loss = G_ssim_loss_F + G_ssim_loss_Q
-
+                # Total generator losses
                 G_adv_loss = G_adv_loss_F + G_adv_loss_Q
                 G_cycle_loss = G_cycle_loss_F + G_cycle_loss_Q
                 G_iden_loss = G_iden_loss_F + G_iden_loss_Q
-
-                # Primary combined objective: L1 + SSIM (for PSNR/SSIM improvements)
-                G_total_loss = lambda_l1 * G_recon_loss + lambda_ssim * G_ssim_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss) + current_lambda_adv * G_adv_loss
+                G_total_loss = G_adv_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss)
 
             # Update the generators with scaled gradients
             G_optim.zero_grad()
@@ -893,16 +814,12 @@ def train(
             # Calculate the average loss during one epoch
             losses['G_adv_loss_F'](G_adv_loss_F.detach())
             losses['G_adv_loss_Q'](G_adv_loss_Q.detach())
-            losses['G_recon_loss'](G_recon_loss.detach())
-            losses['G_ssim_loss'](G_ssim_loss.detach())
             losses['G_cycle_loss_F'](G_cycle_loss_F.detach())
             losses['G_cycle_loss_Q'](G_cycle_loss_Q.detach())
             losses['G_iden_loss_F'](G_iden_loss_F.detach())
             losses['G_iden_loss_Q'](G_iden_loss_Q.detach())
             losses['D_adv_loss_F'](D_adv_loss_F.detach())
             losses['D_adv_loss_Q'](D_adv_loss_Q.detach())
-            # record current adversarial weight
-            losses['G_adv_weight'](current_lambda_adv) 
 
         for name in loss_name:
             losses_list[name].append(losses[name].result())
@@ -960,9 +877,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_res_blocks', type=int, default=3)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--lambda_ssim', type=float, default=1.0)
     parser.add_argument('--use_checkpoint', action='store_true')
-    parser.add_argument('--lambda_adv_init', type=float, default=1.0)
-    parser.add_argument('--lambda_adv_final', type=float, default=0.1)
     
     args = parser.parse_args()
     
