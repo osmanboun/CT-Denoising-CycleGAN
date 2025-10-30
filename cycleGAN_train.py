@@ -18,36 +18,97 @@ from tqdm.auto import tqdm
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 
-# Functions for caculating PSNR, SSIM
-# Peak Signal-to-Noise Ratio
-def psnr(A, ref):
-    ref = ref.copy()
-    A = A.copy()
-    ref[ref < -1000] = -1000
-    A[A < -1000] = -1000
-    val_min = -1000
-    val_max = np.amax(ref)
-    if val_max == val_min:
-        return 0.0
-    ref = (ref - val_min) / (val_max - val_min)
-    A = (A - val_min) / (val_max - val_min)
-    out = peak_signal_noise_ratio(ref, A, data_range=1.0)
-    return out
+# Functions for calculating PSNR, SSIM on a fixed HU/window and optional region-of-interest (mask)
+# Map numpy image (HU-scaled) to unit range [0,1] using fixed window
+def _map_to_unit_np(img, min_hu=-1000.0, max_hu=3000.0):
+    img_u = img.copy().astype(np.float32)
+    # clamp to window
+    img_u = np.clip(img_u, min_hu, max_hu)
+    # map to [0,1]
+    img_u = (img_u - min_hu) / (max_hu - min_hu)
+    return img_u
 
-# Structural similarity index
-def ssim(A, ref):
-    ref = ref.copy()
-    A = A.copy()
-    ref[ref < -1000] = -1000
-    A[A < -1000] = -1000
-    val_min = -1000
-    val_max = np.amax(ref)
-    if val_max == val_min:
+# helper to compute bounding box of a boolean mask
+def _mask_bbox(mask):
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        return None
+    y0, y1 = ys.min(), ys.max() + 1
+    x0, x1 = xs.min(), xs.max() + 1
+    return y0, y1, x0, x1
+
+# Peak Signal-to-Noise Ratio computed on a fixed HU window and optional mask/ROI
+def psnr(A, ref, min_hu=-1000.0, max_hu=3000.0, mask=None):
+    """Compute PSNR between A and ref.
+    Both A and ref are numpy arrays in HU units (or already clipped to HU). This function will
+    clamp both to [min_hu, max_hu], map them to [0,1], and compute PSNR. If `mask` is provided
+    (boolean array same HxW), the metric is computed only inside the mask bounding box (cropped).
+    """
+    ref = ref.copy().astype(np.float32)
+    A = A.copy().astype(np.float32)
+
+    # Map to [0,1] using fixed window
+    ref_u = _map_to_unit_np(ref, min_hu, max_hu)
+    A_u = _map_to_unit_np(A, min_hu, max_hu)
+
+    # If mask supplied, crop to mask bbox for consistent region
+    if mask is not None:
+        mask_bool = mask.astype(bool)
+        if mask_bool.shape != ref_u.shape:
+            raise ValueError('Mask shape must match image shape for PSNR/SSIM computation')
+        bbox = _mask_bbox(mask_bool)
+        if bbox is not None:
+            y0, y1, x0, x1 = bbox
+            ref_u = ref_u[y0:y1, x0:x1]
+            A_u = A_u[y0:y1, x0:x1]
+        else:
+            # empty mask -> fallback to whole image
+            pass
+
+    # If the reference has zero dynamic range after windowing, return 0.0
+    if np.ptp(ref_u) == 0:
         return 0.0
-    ref = (ref - val_min) / (val_max - val_min)
-    A = (A - val_min) / (val_max - val_min)
-    out = structural_similarity(ref, A, data_range=1.0)
-    return out
+
+    return peak_signal_noise_ratio(ref_u, A_u, data_range=1.0)
+
+# Structural similarity index (fixed HU window, optional mask)
+def ssim(A, ref, min_hu=-1000.0, max_hu=3000.0, mask=None):
+    """Compute SSIM between A and ref with a fixed HU window and optional mask/ROI.
+    Returns SSIM in the usual [ -1, 1 ] range (skimage returns up to 1.0).
+    """
+    ref = ref.copy().astype(np.float32)
+    A = A.copy().astype(np.float32)
+
+    # Map to [0,1]
+    ref_u = _map_to_unit_np(ref, min_hu, max_hu)
+    A_u = _map_to_unit_np(A, min_hu, max_hu)
+
+    # If mask supplied, crop to mask bbox for consistent region
+    if mask is not None:
+        mask_bool = mask.astype(bool)
+        if mask_bool.shape != ref_u.shape:
+            raise ValueError('Mask shape must match image shape for PSNR/SSIM computation')
+        bbox = _mask_bbox(mask_bool)
+        if bbox is not None:
+            y0, y1, x0, x1 = bbox
+            ref_u = ref_u[y0:y1, x0:x1]
+            A_u = A_u[y0:y1, x0:x1]
+        else:
+            # empty mask -> fallback to whole image
+            pass
+
+    # If the reference has zero dynamic range after windowing, return 0.0
+    if np.ptp(ref_u) == 0:
+        return 0.0
+
+    return structural_similarity(ref_u, A_u, data_range=1.0)
+
+# Convenience function to compute both metrics at once
+def compute_metrics(A, ref, min_hu=-1000.0, max_hu=3000.0, mask=None):
+    """Return (psnr_val, ssim_val) computed on the fixed window and optional mask/ROI."""
+    p = psnr(A, ref, min_hu=min_hu, max_hu=max_hu, mask=mask)
+    s = ssim(A, ref, min_hu=min_hu, max_hu=max_hu, mask=mask)
+    return p, s
 
 
 # Differentiable SSIM (PyTorch) and helper to map to [0,1]
@@ -476,7 +537,7 @@ class CBAM(nn.Module):
 # --- Dilated Mid Block ---
 class DilatedMidBlock(nn.Module):
     """Stack of conv layers with increasing dilation to enlarge receptive field without downsampling."""
-    def __init__(self, channels, num_layers=5, base_dilation=1):
+    def __init__(self, channels, num_layers=3, base_dilation=1):
         super().__init__()
         layers = []
         for i in range(num_layers):
@@ -533,7 +594,7 @@ class Generator(nn.Module):
         # Bottleneck: Dilated mid-block + Light RDB + optional CBAM
         bottleneck_channels = ngf * ch_mult[-1]
         self.mid_block = nn.Sequential(
-            DilatedMidBlock(bottleneck_channels, num_layers=5, base_dilation=1),
+            DilatedMidBlock(bottleneck_channels, num_layers=3, base_dilation=1),
             LightRDB(bottleneck_channels, growth=rdb_growth, num_layers=3)
         )
         if self.use_cbam:
@@ -648,6 +709,9 @@ def train(
     ch_mult=[1, 2, 4, 8],
     num_res_blocks=3,
     lr=2e-4,
+    # adversarial weight annealing: start and final values (linear interpolation across epochs)
+    lambda_adv_init=1.0,
+    lambda_adv_final=0.1,
     use_checkpoint=False
 ):
     # Hyperparameters
@@ -688,7 +752,8 @@ def train(
     iden_loss = nn.L1Loss()
 
     # Loss functions
-    loss_name = ['G_adv_loss_F',
+    loss_name = [
+                'G_adv_loss_F',
                 'G_adv_loss_Q',
                 'G_recon_loss',
                 'G_ssim_loss',
@@ -697,7 +762,9 @@ def train(
                 'G_iden_loss_F',
                 'G_iden_loss_Q',
                 'D_adv_loss_F',
-                'D_adv_loss_Q']
+                'D_adv_loss_Q',
+                'G_adv_weight'
+            ]
 
     if use_checkpoint:
         # If a checkpoint exists, load the state of the model and optimizer from the checkpoint
@@ -726,6 +793,21 @@ def train(
     for epoch in tqdm(range(trained_epoch, num_epoch), desc='Epoch', total=num_epoch, initial=trained_epoch):
         # Initialize a dictionary to store the mean losses for this epoch
         losses = {name: Mean() for name in loss_name}
+
+        # --- adversarial weight annealing (linear interpolation) ---
+        # Compute current adversarial weight that linearly moves from lambda_adv_init -> lambda_adv_final across epochs
+        if num_epoch > 1:
+            t = float(epoch) / float(max(1, num_epoch - 1))
+            current_lambda_adv = float(lambda_adv_init) + (float(lambda_adv_final) - float(lambda_adv_init)) * t
+        else:
+            current_lambda_adv = float(lambda_adv_final)
+
+        # (optional) clamp to non-negative
+        if current_lambda_adv < 0.0:
+            current_lambda_adv = 0.0
+
+        # You can monitor `current_lambda_adv` in losses['G_adv_weight'] during training
+
 
         for x_F, x_Q, _ in tqdm(train_dataloader, desc='Step'):
             # Move the data to the device (GPU or CPU)
@@ -783,7 +865,7 @@ def train(
                 G_iden_loss = G_iden_loss_F + G_iden_loss_Q
 
                 # Primary combined objective: L1 + SSIM (for PSNR/SSIM improvements)
-                G_total_loss = lambda_l1 * G_recon_loss + lambda_ssim * G_ssim_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss) + G_adv_loss
+                G_total_loss = lambda_l1 * G_recon_loss + lambda_ssim * G_ssim_loss + lambda_cycle * (G_cycle_loss) + lambda_iden * (G_iden_loss) + current_lambda_adv * G_adv_loss
 
             # Update the generators with scaled gradients
             G_optim.zero_grad()
@@ -819,6 +901,8 @@ def train(
             losses['G_iden_loss_Q'](G_iden_loss_Q.detach())
             losses['D_adv_loss_F'](D_adv_loss_F.detach())
             losses['D_adv_loss_Q'](D_adv_loss_Q.detach())
+            # record current adversarial weight
+            losses['G_adv_weight'](current_lambda_adv) 
 
         for name in loss_name:
             losses_list[name].append(losses[name].result())
@@ -877,6 +961,8 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--use_checkpoint', action='store_true')
+    parser.add_argument('--lambda_adv_init', type=float, default=1.0)
+    parser.add_argument('--lambda_adv_final', type=float, default=0.1)
     
     args = parser.parse_args()
     
