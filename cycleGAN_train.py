@@ -145,71 +145,49 @@ class CT_Dataset(Dataset):
         self.path_quarter = join(path, 'quarter_dose')
         self.transform = transform
 
-        # File list of full dose data
-        self.file_full = list()
-        # Only include common numpy array file types; ignore hidden files like .DS_Store and any directories
+        # Only accept these extensions when listing files
         allowed_exts = ('.npy', '.npz')
-        for file_name in sorted(listdir(self.path_full)):
-            full_file = join(self.path_full, file_name)
-            if not isdir(full_file) and file_name.lower().endswith(allowed_exts) and not file_name.startswith('.'):
-                self.file_full.append(file_name)
 
+        # File list of full dose data (filter hidden/non-array files)
+        self.file_full = list()
+        if isdir(self.path_full):
+            for file_name in sorted(listdir(self.path_full)):
+                # skip hidden files (e.g. .DS_Store) and non-array files
+                if file_name.startswith('.'):
+                    continue
+                if not file_name.lower().endswith(allowed_exts):
+                    continue
+                self.file_full.append(file_name)
+        else:
+            raise FileNotFoundError(f"Full-dose folder not found: {self.path_full}")
+
+        # File list of quarter dose data (filter hidden/non-array files)
+        self.file_quarter = list()
+        if isdir(self.path_quarter):
+            for file_name in sorted(listdir(self.path_quarter)):
+                if file_name.startswith('.'):
+                    continue
+                if not file_name.lower().endswith(allowed_exts):
+                    continue
+                self.file_quarter.append(file_name)
+        else:
+            raise FileNotFoundError(f"Quarter-dose folder not found: {self.path_quarter}")
+
+        # Optionally shuffle both lists but keep deterministic seed for reproducibility
         if shuffle:
             random.seed(0)
             random.shuffle(self.file_full)
-        
-        # File list of quarter dose data (same filtering)
-        self.file_quarter = list()
-        for file_name in sorted(listdir(self.path_quarter)):
-            quarter_file = join(self.path_quarter, file_name)
-            if not isdir(quarter_file) and file_name.lower().endswith(allowed_exts) and not file_name.startswith('.'):
-                self.file_quarter.append(file_name)
-
-        # Sanity check
-        if len(self.file_full) == 0 or len(self.file_quarter) == 0:
-            raise RuntimeError(f"No valid numpy files found in '{self.path_full}' or '{self.path_quarter}'. Please check your dataset folders and remove non-numpy files (e.g. .DS_Store).")
+            random.shuffle(self.file_quarter)
 
     def __len__(self):
         return min(len(self.file_full), len(self.file_quarter))
     
     def __getitem__(self, idx):
-        # Load full dose/quarter dose data with a robust loader that accepts .npy and .npz
-        full_path = join(self.path_full, self.file_full[idx])
-        quarter_path = join(self.path_quarter, self.file_quarter[idx])
+        # Load full dose/quarter dose data
+        x_F = np.load(join(self.path_full, self.file_full[idx]))
+        x_Q = np.load(join(self.path_quarter, self.file_quarter[idx]))
 
-        def load_np(path):
-            """Load a numpy file safely and handle common cases:
-            - .npz archives (takes the first array)
-            - .npy files saved with pickled objects (allow_pickle=True)
-            - object-dtype arrays (try to extract .item() or convert to array)
-            Raises a helpful error if loading fails.
-            """
-            try:
-                if path.endswith('.npz'):
-                    # np.load on .npz returns an NpzFile (context-manage to close)
-                    with np.load(path, allow_pickle=True) as d:
-                        keys = list(d.keys())
-                        if len(keys) == 0:
-                            raise ValueError(f"Empty .npz archive: {path}")
-                        arr = d[keys[0]]
-                else:
-                    arr = np.load(path, allow_pickle=True)
-
-                # If array has object dtype (e.g. saved python objects), try to extract
-                if isinstance(arr, np.ndarray) and arr.dtype == object:
-                    try:
-                        arr = arr.item()
-                    except Exception:
-                        arr = np.asarray(arr.tolist())
-
-                return arr
-            except Exception as e:
-                raise ValueError(f"Failed to load '{path}': {e}")
-
-        x_F = load_np(full_path)
-        x_Q = load_np(quarter_path)
-
-        # Convert to HU scale (expecting numeric arrays now)
+        # Convert to HU scale
         x_F = (x_F - 0.0192) / 0.0192 * 1000
         x_Q = (x_Q - 0.0192) / 0.0192 * 1000
 
@@ -926,7 +904,7 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_iden', type=int, default=5)
     parser.add_argument('--beta1', type=float, default=0.5)
     parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--num_epoch', type=int, default=48)
+    parser.add_argument('--num_epoch', type=int, default=28)
     parser.add_argument('--g_channels', type=int, default=32)
     parser.add_argument('--d_channels', type=int, default=64)
     parser.add_argument('--ch_mult', type=int, nargs='+', default=[1, 2, 4, 8])
