@@ -138,6 +138,35 @@ class Mean:
 
 
 # CT dataset
+def _is_valid_np_file(fname):
+    # ignore hidden files and accept only .npy/.npz (case-insensitive)
+    if fname.startswith('.'):
+        return False
+    fname_lower = fname.lower()
+    return fname_lower.endswith('.npy') or fname_lower.endswith('.npz')
+
+
+def load_array(full_path):
+    """Safely load .npy or .npz without allow_pickle. Raises informative errors if something's wrong."""
+    if full_path.lower().endswith('.npy'):
+        try:
+            return np.load(full_path, allow_pickle=False)
+        except Exception as e:
+            raise ValueError(f"Failed to load .npy file '{full_path}': {e}. This file may contain pickled objects. Convert to a numeric array (.npy) or remove it from the dataset.") from e
+    elif full_path.lower().endswith('.npz'):
+        try:
+            with np.load(full_path, allow_pickle=False) as z:
+                keys = list(z.files)
+                if len(keys) == 0:
+                    raise ValueError(f".npz file '{full_path}' contains no arrays.")
+                # return the first array by default; adapt if your .npz uses a specific key
+                return z[keys[0]]
+        except Exception as e:
+            raise ValueError(f"Failed to load .npz file '{full_path}': {e}. Inspect the archive contents or convert to .npy files.") from e
+    else:
+        raise ValueError(f"Unsupported file type: {full_path}")
+
+
 class CT_Dataset(Dataset):
     def __init__(self, path, transform, shuffle=True):
         # Path of 'full_dose' and 'quarter_dose' folders
@@ -145,47 +174,40 @@ class CT_Dataset(Dataset):
         self.path_quarter = join(path, 'quarter_dose')
         self.transform = transform
 
-        # Only accept these extensions when listing files
-        allowed_exts = ('.npy', '.npz')
+        # Validate directories
+        if not isdir(self.path_full):
+            raise ValueError(f"Full-dose directory not found: {self.path_full}")
+        if not isdir(self.path_quarter):
+            raise ValueError(f"Quarter-dose directory not found: {self.path_quarter}")
 
-        # File list of full dose data (filter hidden/non-array files)
-        self.file_full = list()
-        if isdir(self.path_full):
-            for file_name in sorted(listdir(self.path_full)):
-                # skip hidden files (e.g. .DS_Store) and non-array files
-                if file_name.startswith('.'):
-                    continue
-                if not file_name.lower().endswith(allowed_exts):
-                    continue
-                self.file_full.append(file_name)
-        else:
-            raise FileNotFoundError(f"Full-dose folder not found: {self.path_full}")
+        # Gather only .npy and .npz files, ignore hidden files and directories
+        self.file_full = [f for f in sorted(listdir(self.path_full))
+                          if _is_valid_np_file(f) and not isdir(join(self.path_full, f))]
+        self.file_quarter = [f for f in sorted(listdir(self.path_quarter))
+                             if _is_valid_np_file(f) and not isdir(join(self.path_quarter, f))]
 
-        # File list of quarter dose data (filter hidden/non-array files)
-        self.file_quarter = list()
-        if isdir(self.path_quarter):
-            for file_name in sorted(listdir(self.path_quarter)):
-                if file_name.startswith('.'):
-                    continue
-                if not file_name.lower().endswith(allowed_exts):
-                    continue
-                self.file_quarter.append(file_name)
-        else:
-            raise FileNotFoundError(f"Quarter-dose folder not found: {self.path_quarter}")
-
-        # Optionally shuffle both lists but keep deterministic seed for reproducibility
         if shuffle:
             random.seed(0)
             random.shuffle(self.file_full)
             random.shuffle(self.file_quarter)
 
+        # Clear error if no valid files found
+        if len(self.file_full) == 0:
+            raise ValueError(f"No valid .npy/.npz files found in '{self.path_full}'. Please check the dataset folder and remove hidden or non-numpy files (e.g. .DS_Store).")
+        if len(self.file_quarter) == 0:
+            raise ValueError(f"No valid .npy/.npz files found in '{self.path_quarter}'. Please check the dataset folder and remove hidden or non-numpy files (e.g. .DS_Store).")
+
     def __len__(self):
         return min(len(self.file_full), len(self.file_quarter))
-    
+
     def __getitem__(self, idx):
-        # Load full dose/quarter dose data
-        x_F = np.load(join(self.path_full, self.file_full[idx]))
-        x_Q = np.load(join(self.path_quarter, self.file_quarter[idx]))
+        # Build full paths
+        full_path = join(self.path_full, self.file_full[idx])
+        quarter_path = join(self.path_quarter, self.file_quarter[idx])
+
+        # Use safe loader
+        x_F = load_array(full_path)
+        x_Q = load_array(quarter_path)
 
         # Convert to HU scale
         x_F = (x_F - 0.0192) / 0.0192 * 1000
