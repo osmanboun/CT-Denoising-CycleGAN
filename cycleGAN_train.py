@@ -591,7 +591,7 @@ def train(
     path_checkpoint='./CT_denoising',
     model_name='cyclegan_v1',
     path_data='../data/AAPM_data',
-    batch_size=16,
+    batch_size=8,
     lambda_cycle=10,
     lambda_iden=5,
     beta1=0.5,
@@ -802,7 +802,7 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_iden', type=int, default=5)
     parser.add_argument('--beta1', type=float, default=0.5)
     parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--num_epoch', type=int, default=120)
+    parser.add_argument('--num_epoch', type=int, default=100)
     parser.add_argument('--g_channels', type=int, default=32)
     parser.add_argument('--d_channels', type=int, default=64)
     parser.add_argument('--ch_mult', type=int, nargs='+', default=[1, 2, 4, 8])
