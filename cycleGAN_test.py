@@ -350,6 +350,40 @@ def test(
     summary_csv = join(path_result, 'summary_metrics.csv')
     summary_df.to_csv(summary_csv, index=False)
 
+    # --- Print concise metric summary in the requested format ---
+    def _mean_std(arr):
+        a = np.array(arr)
+        mean = float(np.mean(a)) if a.size > 0 else 0.0
+        std = float(np.std(a, ddof=1)) if a.size > 1 else 0.0
+        return mean, std
+
+    m_psnr_in, s_psnr_in = _mean_std(psnr_quarter)
+    m_psnr_out, s_psnr_out = _mean_std(psnr_output)
+    m_ssim_in, s_ssim_in = _mean_std(ssim_quarter)
+    m_ssim_out, s_ssim_out = _mean_std(ssim_output)
+    m_rmse_in, s_rmse_in = _mean_std(rmse_input)
+    m_rmse_out, s_rmse_out = _mean_std(rmse_output)
+    m_mae_in, s_mae_in = _mean_std(mae_input)
+    m_mae_out, s_mae_out = _mean_std(mae_output)
+    m_nmse_in, s_nmse_in = _mean_std(nmse_input)
+    m_nmse_out, s_nmse_out = _mean_std(nmse_output)
+    m_hfen_in, s_hfen_in = _mean_std(hfen_input)
+    m_hfen_out, s_hfen_out = _mean_std(hfen_output)
+    m_snr_in, s_snr_in = _mean_std(snr_input)
+    m_snr_out, s_snr_out = _mean_std(snr_output)
+    # EKI: input baseline is 0 by definition in this script
+    m_eki_out, s_eki_out = _mean_std(eki_list)
+
+    print('Metric summary (mean ± std)')
+    print(f"PSNR: input = {m_psnr_in:.3f} ± {s_psnr_in:.3f} | output = {m_psnr_out:.3f} ± {s_psnr_out:.3f}")
+    print(f"SSIM: input = {m_ssim_in:.3f} ± {s_ssim_in:.3f} | output = {m_ssim_out:.3f} ± {s_ssim_out:.3f}")
+    print(f"RMSE: input = {m_rmse_in:.3f} ± {s_rmse_in:.3f} | output = {m_rmse_out:.3f} ± {s_rmse_out:.3f}")
+    print(f"MAE: input = {m_mae_in:.3f} ± {s_mae_in:.3f} | output = {m_mae_out:.3f} ± {s_mae_out:.3f}")
+    print(f"NMSE: input = {m_nmse_in:.6f} ± {s_nmse_in:.6f} | output = {m_nmse_out:.6f} ± {s_nmse_out:.6f}")
+    print(f"HFEN: input = {m_hfen_in:.3f} ± {s_hfen_in:.3f} | output = {m_hfen_out:.3f} ± {s_hfen_out:.3f}")
+    print(f"SNR(dB): input = {m_snr_in:.3f} ± {s_snr_in:.3f} | output = {m_snr_out:.3f} ± {s_snr_out:.3f}")
+    print(f"EKI: input = {0.0:.3f} ± {0.0:.3f} | output = {m_eki_out:.3f} ± {s_eki_out:.3f}")
+
     # --- Statistical tests on paired differences (PSNR & SSIM kept as before) ---
     stats_results = []
 
@@ -550,6 +584,39 @@ def test(
             ax.axis('off')
         cbar = fig.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
         save_figure(fig, join(qual_dir, f'qual_{filenames[idx]}.png'))
+    # --- Create a new folder with 3-column row examples: quarter_dose | network_output | noise (quarter - output) ---
+    qual_rows_dir = join(path_result, 'qual_examples_rows')
+    ensure_dir(qual_rows_dir)
+    # pick exactly 6 samples (or fewer if dataset smaller)
+    n_row_samples = min(6, num_files)
+    row_indices = random.sample(range(num_files), n_row_samples)
+    for j, idx in enumerate(row_indices):
+        quarter = np.load(quarter_files[idx])
+        output = np.load(output_files[idx])
+
+        # scale/clip for visualization (same transform used above)
+        quarter_v = np.clip((quarter - 0.0192) / 0.0192 * 1000, -1000, 1000)
+        output_v = np.clip(output, -1000, 1000)
+        noise_v = quarter_v - output_v  # keep sign: positive where quarter has higher values
+
+        # symmetric color range for noise map centered at 0
+        vmax = np.max(np.abs(noise_v)) if np.max(np.abs(noise_v)) > 0 else 1.0
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes[0].imshow(quarter_v, cmap='gray')
+        axes[0].set_title('Quarter Dose')
+        axes[0].axis('off')
+
+        axes[1].imshow(output_v, cmap='gray')
+        axes[1].set_title('Network Output')
+        axes[1].axis('off')
+
+        im = axes[2].imshow(noise_v, cmap='seismic', vmin=-vmax, vmax=vmax)
+        axes[2].set_title('Noise (Quarter - Output)')
+        axes[2].axis('off')
+        cbar = fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+
+        save_figure(fig, join(qual_rows_dir, f'qual_row_{filenames[idx]}.png'))
 
     # 6) CDF / histogram of metric improvements
     improvements_psnr = psnr_o - psnr_q
