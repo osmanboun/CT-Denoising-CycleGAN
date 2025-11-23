@@ -587,7 +587,7 @@ def train(
     path_checkpoint='./CT_denoising',
     model_name='cyclegan_v1',
     path_data='../data/AAPM_data',
-    batch_size=8,
+    batch_size=16,
     lambda_cycle=10,
     lambda_iden=5,
     beta1=0.5,
