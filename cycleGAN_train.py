@@ -98,22 +98,18 @@ class CT_Dataset(Dataset):
         self.transform = transform
 
         # File list of full dose data
-        valid_ext = ('.npy', '.npz')
-
-        def list_valid_files(p):
-            files = [f for f in sorted(listdir(p)) if not f.startswith('.') and f.lower().endswith(valid_ext)]
-            if len(files) == 0:
-                raise RuntimeError(f'No valid .npy/.npz files found in {p}. Make sure the directory contains only array files and remove hidden files like .DS_Store')
-            return files
-
-        # File list of full dose data (only keep .npy/.npz and ignore hidden files)
-        self.file_full = list_valid_files(self.path_full)
+        self.file_full = list()
+        for file_name in sorted(listdir(self.path_full)):
+            self.file_full.append(file_name)
+            
         if shuffle:
             random.seed(0)
             random.shuffle(self.file_full)
-
-        # File list of quarter dose data (only keep .npy/.npz and ignore hidden files)
-        self.file_quarter = list_valid_files(self.path_quarter)
+        
+        # File list of quarter dose data
+        self.file_quarter = list()
+        for file_name in sorted(listdir(self.path_quarter)):
+            self.file_quarter.append(file_name)
     
     def __len__(self):
         return min(len(self.file_full), len(self.file_quarter))
