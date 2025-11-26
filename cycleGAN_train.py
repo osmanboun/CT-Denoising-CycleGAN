@@ -98,22 +98,18 @@ class CT_Dataset(Dataset):
         self.transform = transform
 
         # File list of full dose data
-        valid_ext = ('.npy', '.npz')
-
-        def list_valid_files(p):
-            files = [f for f in sorted(listdir(p)) if not f.startswith('.') and f.lower().endswith(valid_ext)]
-            if len(files) == 0:
-                raise RuntimeError(f'No valid .npy/.npz files found in {p}. Make sure the directory contains only array files and remove hidden files like .DS_Store')
-            return files
-
-        # File list of full dose data (only keep .npy/.npz and ignore hidden files)
-        self.file_full = list_valid_files(self.path_full)
+        self.file_full = list()
+        for file_name in sorted(listdir(self.path_full)):
+            self.file_full.append(file_name)
+            
         if shuffle:
             random.seed(0)
             random.shuffle(self.file_full)
-
-        # File list of quarter dose data (only keep .npy/.npz and ignore hidden files)
-        self.file_quarter = list_valid_files(self.path_quarter)
+        
+        # File list of quarter dose data
+        self.file_quarter = list()
+        for file_name in sorted(listdir(self.path_quarter)):
+            self.file_quarter.append(file_name)
     
     def __len__(self):
         return min(len(self.file_full), len(self.file_quarter))
@@ -231,6 +227,7 @@ def make_dataloader(path, train_batch_size=1, is_train=True):
     return dataloader
 
   
+
 class ResnetBlock(nn.Module):
     '''
     Residual block
@@ -617,9 +614,9 @@ def train(
 
     # Make dataloaders
     train_dataloader = make_dataloader(path_data, batch_size)
-    # Validation/test dataloader for PSNR-based model selection (batch_size=1)
-    test_dataloader = make_dataloader(path_data, 1, is_train=False)
-    # Track best PSNR and epoch
+    # Validation dataloader (used to compute PSNR and select best model)
+    val_dataloader = make_dataloader(path_data, 1, is_train=False)
+    # Track best PSNR
     best_psnr = -1e9
     best_epoch = -1
 
@@ -760,48 +757,49 @@ def train(
         for name in loss_name:
             losses_list[name].append(losses[name].result())
         
-        # Evaluate on validation/test set (compute average PSNR) and save model if it's the best so far
-        G_F2Q.eval()
-        G_Q2F.eval()
-        avg_psnr = None
-        with torch.no_grad():
-            psnr_vals = []
-            for x_F_t, x_Q_t, _ in test_dataloader:
-                x_F_t = x_F_t.to(device)
-                x_Q_t = x_Q_t.to(device)
-                # Use generator that maps quarter->full for denoising
-                out_F = G_Q2F(x_Q_t)
-                out_np = out_F.detach().cpu().numpy()
-                ref_np = x_F_t.detach().cpu().numpy()
-                # assume shape (B,1,H,W)
-                for b in range(out_np.shape[0]):
-                    pred = out_np[b,0,...]
-                    ref = ref_np[b,0,...]
-                    psnr_val = psnr(pred, ref)
-                    psnr_vals.append(psnr_val)
-            if len(psnr_vals) > 0:
-                avg_psnr = float(np.mean(psnr_vals))
-            else:
-                avg_psnr = -1e9
-
-        # Save loss lists
+        # Save epoch checkpoint (per-epoch file)
+        torch.save({'epoch': epoch + 1, 'G_F2Q_state_dict': G_F2Q.state_dict(), 'G_Q2F_state_dict': G_Q2F.state_dict(),
+                        'D_F_state_dict': D_F.state_dict(), 'D_Q_state_dict': D_Q.state_dict(),
+                        'G_optim_state_dict': G_optim.state_dict(), 'D_optim_state_dict': D_optim.state_dict()}, join(path_checkpoint, f"{model_name}_epoch{epoch+1}.pth"))
+        # Save losses
         for name in loss_name:
             torch.save(losses_list[name], join(path_result, name + '.npy'))
 
-        # If this epoch produced a better PSNR, save the models as the new best (overwrite checkpoint)
-        if avg_psnr is not None and avg_psnr > best_psnr:
+        # Evaluate on validation set (PSNR of G_Q2F output vs full-dose)
+        G_Q2F.eval()
+        G_F2Q.eval()
+        total_psnr = 0.0
+        cnt = 0
+        with torch.no_grad():
+            for v_F, v_Q, _ in val_dataloader:
+                v_F = v_F.to(device)
+                v_Q = v_Q.to(device)
+                out = G_Q2F(v_Q)
+                # Denormalize back to HU-like scale used by psnr()
+                out_np = out.detach().cpu().numpy()
+                ref_np = v_F.detach().cpu().numpy()
+                # squeeze batch and channel
+                out_np = out_np.squeeze()
+                ref_np = ref_np.squeeze()
+                out_np = out_np * 4000.0
+                ref_np = ref_np * 4000.0
+                total_psnr += psnr(out_np, ref_np)
+                cnt += 1
+        avg_psnr = total_psnr / max(1, cnt)
+        print(f"Epoch {epoch+1}: val PSNR = {avg_psnr:.4f}")
+        G_Q2F.train()
+        G_F2Q.train()
+
+        # If PSNR improved, save as the best model (overwrite main checkpoint)
+        if avg_psnr > best_psnr:
             best_psnr = avg_psnr
             best_epoch = epoch + 1
             torch.save({'epoch': epoch + 1, 'G_F2Q_state_dict': G_F2Q.state_dict(), 'G_Q2F_state_dict': G_Q2F.state_dict(),
                         'D_F_state_dict': D_F.state_dict(), 'D_Q_state_dict': D_Q.state_dict(),
                         'G_optim_state_dict': G_optim.state_dict(), 'D_optim_state_dict': D_optim.state_dict(),
                         'best_psnr': best_psnr}, join(path_checkpoint, model_name + '.pth'))
-            print(f'Saved new best model at epoch {best_epoch} with PSNR {best_psnr:.4f}')
-
-        # Return models to training mode
-        G_F2Q.train()
-        G_Q2F.train()
-        
+            print(f"New best model saved with PSNR {best_psnr:.4f} at epoch {best_epoch}")
+            
     # Plot loss graph (adversarial loss)
     plt.figure(1)
     for name in ['G_adv_loss_F', 'G_adv_loss_Q', 'D_adv_loss_F', 'D_adv_loss_Q']:
@@ -829,11 +827,6 @@ def train(
     plt.savefig(join(path_result, 'loss_curve_2.png'))
     plt.close() 
     
-    # Print information about the best epoch
-    if best_epoch > 0:
-        print(f'Best model saved from epoch {best_epoch} with PSNR {best_psnr:.4f} (checkpoint: {join(path_checkpoint, model_name + ".pth")})')
-    else:
-        print('No PSNR improvement observed during training; no best model saved.')
     
 if __name__ == '__main__':
     # Parse arguments
