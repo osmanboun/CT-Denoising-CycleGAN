@@ -3,7 +3,6 @@ import argparse
 import itertools
 import numpy as np
 import matplotlib.pyplot as plt
-import shutil
 
 import torch
 import torch.nn as nn
@@ -98,64 +97,27 @@ class CT_Dataset(Dataset):
         self.path_quarter = join(path, 'quarter_dose')
         self.transform = transform
 
-        # File list of full dose data (only include .npy/.npz and skip hidden or non-data files)
+        # File list of full dose data
         self.file_full = list()
         for file_name in sorted(listdir(self.path_full)):
-            # skip hidden files (e.g. .DS_Store) and non-numpy files
-            if file_name.startswith('.'):
-                continue
-            low = file_name.lower()
-            if low.endswith('.npy') or low.endswith('.npz'):
-                self.file_full.append(file_name)
-            else:
-                # skip other extensions
-                continue
+            self.file_full.append(file_name)
             
         if shuffle:
             random.seed(0)
             random.shuffle(self.file_full)
         
-        # File list of quarter dose data (only include .npy/.npz and skip hidden files)
+        # File list of quarter dose data
         self.file_quarter = list()
         for file_name in sorted(listdir(self.path_quarter)):
-            if file_name.startswith('.'):
-                continue
-            low = file_name.lower()
-            if low.endswith('.npy') or low.endswith('.npz'):
-                self.file_quarter.append(file_name)
-            else:
-                continue
-
-        # Sanity check
-        if len(self.file_full) == 0 or len(self.file_quarter) == 0:
-            raise RuntimeError(f'No .npy or .npz files found in "{self.path_full}" or "{self.path_quarter}"')
+            self.file_quarter.append(file_name)
     
     def __len__(self):
         return min(len(self.file_full), len(self.file_quarter))
     
     def __getitem__(self, idx):
-        # Load full dose/quarter dose data (robust to .npz and pickled arrays)
-        def _safe_load(path):
-            path_low = path.lower()
-            try:
-                if path_low.endswith('.npz'):
-                    with np.load(path) as data:
-                        if len(data.files) > 0:
-                            return data[data.files[0]]
-                        else:
-                            raise RuntimeError(f'NPZ file {path} contains no arrays.')
-                else:
-                    # prefer safe loading (no pickle)
-                    return np.load(path, allow_pickle=False)
-            except ValueError:
-                # Fallback: some legacy files may require allow_pickle=True — try cautiously
-                try:
-                    return np.load(path, allow_pickle=True)
-                except Exception as e:
-                    raise RuntimeError(f'Failed to load {path}: {e}')
-
-        x_F = _safe_load(join(self.path_full, self.file_full[idx]))
-        x_Q = _safe_load(join(self.path_quarter, self.file_quarter[idx]))
+        # Load full dose/quarter dose data
+        x_F = np.load(join(self.path_full, self.file_full[idx]))
+        x_Q = np.load(join(self.path_quarter, self.file_quarter[idx]))
 
         # Convert to HU scale
         x_F = (x_F - 0.0192) / 0.0192 * 1000
@@ -259,7 +221,7 @@ def make_dataloader(path, train_batch_size=1, is_train=True):
             torchvision.transforms.ToTensor()
         ])
 
-        test_dataset = CT_Dataset(dataset_path, test_transform)
+        test_dataset = CT_Dataset(dataset_path, test_transform, shuffle=False)
         dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
 
     return dataloader
@@ -652,7 +614,6 @@ def train(
 
     # Make dataloaders
     train_dataloader = make_dataloader(path_data, batch_size)
-    # Test dataloader for PSNR evaluation (batch_size=1)
     test_dataloader = make_dataloader(path_data, 1, is_train=False)
 
     # Make generators (G_F2Q: full to quarter / G_Q2F: quarter to full)
@@ -710,10 +671,9 @@ def train(
     losses_list = {name: list() for name in loss_name}
     print('Start from random initialized model')
 
-    # Variables to track the best model by PSNR
-    best_psnr = -1.0
+    # Best model tracking (by PSNR on test set)
+    best_psnr = float('-inf')
     best_epoch = -1
-    best_checkpoint_path = join(path_checkpoint, model_name + '_best.pth')
 
     # Start the training loop
     for epoch in tqdm(range(trained_epoch, num_epoch), desc='Epoch', total=num_epoch, initial=trained_epoch):
@@ -797,70 +757,52 @@ def train(
         for name in loss_name:
             losses_list[name].append(losses[name].result())
         
-        # Save the trained model (last epoch) and list of losses
-        torch.save({'epoch': epoch + 1, 'G_F2Q_state_dict': G_F2Q.state_dict(), 'G_Q2F_state_dict': G_Q2F.state_dict(),
-                        'D_F_state_dict': D_F.state_dict(), 'D_Q_state_dict': D_Q.state_dict(),
-                        'G_optim_state_dict': G_optim.state_dict(), 'D_optim_state_dict': D_optim.state_dict()}, join(path_checkpoint, model_name + '.pth'))
+        # --- Evaluate on test set (compute mean PSNR) ---
+        G_Q2F.eval()
+        mean_psnr = 0.0
+        num_samples = 0
+        with torch.no_grad():
+            for x_F_t, x_Q_t, _ in test_dataloader:
+                x_F_t = x_F_t.to(device)
+                x_Q_t = x_Q_t.to(device)
+                pred = G_Q2F(x_Q_t)
+                # convert back to HU scale used in psnr(): x * 4000
+                pred_np = pred.detach().cpu().numpy().squeeze() * 4000.0
+                ref_np = x_F_t.detach().cpu().numpy().squeeze() * 4000.0
+                try:
+                    cur_psnr = psnr(pred_np, ref_np)
+                except Exception:
+                    cur_psnr = 0.0
+                mean_psnr += cur_psnr
+                num_samples += 1
+        if num_samples > 0:
+            mean_psnr = mean_psnr / num_samples
+        else:
+            mean_psnr = 0.0
+        G_Q2F.train()
+
+        print(f"Epoch {epoch+1}/{num_epoch} - mean PSNR on test set: {mean_psnr:.4f}")
+
+        # Save checkpoint only if this epoch is the best so far by PSNR
+        if mean_psnr > best_psnr:
+            best_psnr = mean_psnr
+            best_epoch = epoch + 1
+            torch.save({'epoch': epoch + 1,
+                        'G_F2Q_state_dict': G_F2Q.state_dict(),
+                        'G_Q2F_state_dict': G_Q2F.state_dict(),
+                        'D_F_state_dict': D_F.state_dict(),
+                        'D_Q_state_dict': D_Q.state_dict(),
+                        'G_optim_state_dict': G_optim.state_dict(),
+                        'D_optim_state_dict': D_optim.state_dict(),
+                        'best_psnr': best_psnr}, join(path_checkpoint, model_name + '.pth'))
+            print(f"Saved new best model (epoch {best_epoch}) with PSNR={best_psnr:.4f} to {join(path_checkpoint, model_name + '.pth')}")
+
+        # Save losses (keeps per-epoch losses for plotting but no intermediate model checkpoints)
         for name in loss_name:
             torch.save(losses_list[name], join(path_result, name + '.npy'))
-
-        # ------------------------
-        #  Evaluate on test set by average PSNR (quarter->full mapping)
-        # ------------------------
-        # If there is no test set, skip evaluation
-        try:
-            test_len = len(test_dataloader.dataset)
-        except Exception:
-            test_len = 0
-
-        avg_psnr = None
-        if test_len > 0:
-            G_Q2F.eval()
-            G_F2Q.eval()
-            psnr_vals = []
-            with torch.no_grad():
-                for x_F_t, x_Q_t, _ in test_dataloader:
-                    x_F_t = x_F_t.to(device)
-                    x_Q_t = x_Q_t.to(device)
-                    # Generate full-dose estimate from quarter-dose image
-                    x_QF_t = G_Q2F(x_Q_t)
-
-                    # Convert tensors back to HU scale by multiplying by 4000 (inverse of dataset normalization)
-                    ref = x_F_t.cpu().numpy().squeeze() * 4000.0
-                    pred = x_QF_t.cpu().numpy().squeeze() * 4000.0
-
-                    # Compute PSNR using the provided function (expects HU scale)
-                    val = psnr(pred, ref)
-                    psnr_vals.append(val)
-
-            if len(psnr_vals) > 0:
-                avg_psnr = float(np.mean(psnr_vals))
-            else:
-                avg_psnr = None
-
-            print(f"Epoch {epoch+1}: validation PSNR = {avg_psnr:.4f}")
-
-            # If this is the best PSNR so far, save a checkpoint as the best
-            if avg_psnr is not None and avg_psnr > best_psnr:
-                best_psnr = avg_psnr
-                best_epoch = epoch + 1
-                torch.save({'epoch': epoch + 1, 'G_F2Q_state_dict': G_F2Q.state_dict(), 'G_Q2F_state_dict': G_Q2F.state_dict(),
-                                'D_F_state_dict': D_F.state_dict(), 'D_Q_state_dict': D_Q.state_dict(),
-                                'G_optim_state_dict': G_optim.state_dict(), 'D_optim_state_dict': D_optim.state_dict()}, best_checkpoint_path)
-                print(f"New best model saved at epoch {best_epoch} with PSNR={best_psnr:.4f}")
-
-            # Return models to train mode
-            G_Q2F.train()
-            G_F2Q.train()
-
-    # After training, if we have a best checkpoint, overwrite the final model with the best one
-    if best_epoch > 0 and isdir(path_checkpoint):
-        try:
-            shutil.copyfile(best_checkpoint_path, join(path_checkpoint, model_name + '.pth'))
-            print(f"Best model from epoch {best_epoch} (PSNR={best_psnr:.4f}) copied to {join(path_checkpoint, model_name + '.pth')}")
-        except Exception as e:
-            print(f"Warning: failed to copy best checkpoint to final path: {e}")
-
+            
+    print(f"Training finished. Best PSNR={best_psnr:.4f} at epoch {best_epoch}.")
+    
     # Plot loss graph (adversarial loss)
     plt.figure(1)
     for name in ['G_adv_loss_F', 'G_adv_loss_Q', 'D_adv_loss_F', 'D_adv_loss_Q']:
@@ -888,13 +830,7 @@ def train(
     plt.savefig(join(path_result, 'loss_curve_2.png'))
     plt.close() 
     
-    # Print best epoch info
-    if best_epoch > 0:
-        print(f"Training completed. Best PSNR: {best_psnr:.4f} at epoch {best_epoch}")
-    else:
-        print("Training completed. No validation PSNR was computed (no test set found).")
     
-
 if __name__ == '__main__':
     # Parse arguments
     parser = argparse.ArgumentParser()
